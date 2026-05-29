@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+
+# Large local inputs and generated data
+MSEED/
+stationxml/
+openswpc_model/
+openswpc_cases/
+o20/
+*.npz
+*.h5
+*.hdf5
+*.mseed
+*.sac
+*.nc
+
+# Figures and run products
+*.png
+*.pdf
+*.svg
+inversion_result/
+logs/
+lightning_logs/

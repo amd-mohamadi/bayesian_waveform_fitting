@@ -1,0 +1,13 @@
+numpy
+scipy
+matplotlib
+pandas
+obspy
+pyproj
+tqdm
+torch
+tslearn
+xarray
+netCDF4
+h5py
+pyrocko
