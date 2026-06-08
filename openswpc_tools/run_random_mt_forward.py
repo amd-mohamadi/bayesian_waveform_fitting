@@ -1,4 +1,5 @@
 import argparse
+import json
 import pickle
 import subprocess
 import sys
@@ -10,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from run_simulated_inversion import load_stations_from_xml
+from src_smc_mti.io import load_stations_from_xml
 
 
 def _round_down(x: float, step: float) -> float:
@@ -51,6 +52,7 @@ def _build_input_text(
     fq_max: float,
     trise: float,
     vcut: float,
+    pml_width: int,
 ):
     return (
         f"""
@@ -108,7 +110,7 @@ def _build_input_text(
   kdec             = 2
 
   sw_wav_v         = .true.
-  sw_wav_u         = .true.
+  sw_wav_u         = .false.
   sw_wav_stress    = .false.
   sw_wav_strain    = .false.
   ntdec_w          = 1
@@ -125,7 +127,7 @@ def _build_input_text(
   pw_mode          = .false.
 
   abc_type         = 'pml'
-  na               = 20
+  na               = {pml_width}
   stabilize_pml    = .false.
 
   vmodel_type      = 'user'
@@ -190,6 +192,7 @@ def main():
     parser.add_argument("--fmax", type=float, default=100.0)
     parser.add_argument("--trise", type=float, default=0.006)
     parser.add_argument("--vcut", type=float, default=1.5)
+    parser.add_argument("--pml-width", type=int, default=20)
     parser.add_argument("--nproc-x", type=int, default=2)
     parser.add_argument("--nproc-y", type=int, default=2)
     parser.add_argument("--ref-elevation", type=float, default=1650.0249)
@@ -222,7 +225,32 @@ def main():
     ref_e = float(source.get("easting", 334641.1891)) - sx_m
     ref_n = float(source.get("northing", 4263443.693)) - sy_m
 
-    stations, _, _, _ = load_stations_from_xml(args.stations_dir)
+    stations_all, codes_all, _, _ = load_stations_from_xml(args.stations_dir)
+    station_ids = [str(sid) for sid in invdata["station_ids"]]
+    by_id = {str(code): i for i, code in enumerate(codes_all)}
+    by_station = {}
+    for i, code in enumerate(codes_all):
+        parts = str(code).split(".")
+        if len(parts) > 1:
+            by_station.setdefault(parts[1], i)
+
+    rows = []
+    station_meta = []
+    missing = []
+    for sid in station_ids:
+        parts = sid.split(".")
+        sta = parts[1] if len(parts) > 1 else sid
+        idx = by_id.get(sid, by_station.get(sta))
+        if idx is None:
+            missing.append(sid)
+            continue
+        src = stations_all[idx]
+        rows.append([len(rows) + 1, float(src[1]), float(src[2]), float(src[3])])
+        station_meta.append({"label": f"st{len(rows):03d}", "station_id": sid})
+    if missing:
+        raise RuntimeError(f"StationXML missing event station(s): {missing}")
+
+    stations = np.asarray(rows, dtype=float)
     x_sta = stations[:, 1].astype(float)
     y_sta = stations[:, 2].astype(float)
     z_sta = stations[:, 3].astype(float)
@@ -246,6 +274,18 @@ def main():
 
     case_dir = out_dir
     case_dir.mkdir(parents=True, exist_ok=True)
+    model_link = case_dir / "model.nc"
+    if model_link.exists() or model_link.is_symlink():
+        if model_link.is_symlink():
+            model_link.unlink()
+    if not model_link.exists():
+        try:
+            model_link.symlink_to(model_nc)
+            model_for_input = Path("model.nc")
+        except OSError:
+            model_for_input = model_nc
+    else:
+        model_for_input = Path("model.nc")
 
     st_file = case_dir / "stloc.xy"
     with st_file.open("w", encoding="utf-8") as f:
@@ -255,6 +295,10 @@ def main():
             f.write(
                 f"{x_sta[i] / 1000.0:10.5f} {y_sta[i] / 1000.0:10.5f} {z_sta[i] / 1000.0:10.5f} {stnm:>10s} dep\n"
             )
+    (case_dir / "station_order.json").write_text(
+        json.dumps({"stations": station_meta, "component_order": ["Z", "N", "E"]}, indent=2),
+        encoding="utf-8",
+    )
 
     mxx, myy, mzz, myz, mxz, mxy = _random_mt_components(args.seed)
     src_file = case_dir / "source_random.dat"
@@ -266,11 +310,11 @@ def main():
         )
 
     input_text = _build_input_text(
-        title="forge_random_mt_f100",
-        odir=(case_dir / "out"),
-        station_file=st_file,
-        source_file=src_file,
-        model_nc=model_nc,
+        title="cape_random_mt",
+        odir=Path("out"),
+        station_file=Path("stloc.xy"),
+        source_file=Path("source_random.dat"),
+        model_nc=model_for_input,
         ref_e=ref_e,
         ref_n=ref_n,
         ref_h=args.ref_elevation,
@@ -288,6 +332,7 @@ def main():
         fq_max=args.fmax,
         trise=args.trise,
         vcut=args.vcut,
+        pml_width=int(args.pml_width),
     )
 
     (case_dir / "input_random.inf").write_text(input_text, encoding="utf-8")

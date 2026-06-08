@@ -1,19 +1,40 @@
 # Bayesian Waveform Fitting
 
-Moment tensor waveform fitting for FORGE microseismic events using prepared
-real-event waveforms, OpenSWPC Green's-function libraries, and SMC/CMA-ES
-search with GSOT, Soft-DTW, or L2 waveform likelihoods.
+Moment tensor waveform fitting for FORGE/CAPE microseismic events using
+prepared real-event waveforms, Axitra synthetics, and SMC/CMA-ES search with
+GSOT, Soft-DTW, or L2 waveform likelihoods.
+
+## Project goal and current stage
+
+The long-term goal is to build a general joint Bayesian inversion code that
+estimates moment tensor, event location, magnitude, and source-time parameters
+together from waveform data.
+
+The current stage is focused on fast enough synthetic waveforms for Bayesian
+inversion. OpenSWPC remains available for reference Green's-function studies,
+but the active CAPE workflow now uses Axitra because direct OpenSWPC runs are
+too slow for the target iteration loop.
+
+CAPE is the current application project and data set used to develop and test
+this workflow. CAPE-specific scripts and documentation record the current case
+setup, but the intended inversion framework is not limited to CAPE.
 
 ## What is included
 
 - `prepare_invdata.py` prepares `invdata.pkl` from mseed waveforms, picks,
   catalog metadata, and StationXML.
 - `run_inversion.py` is the main inversion script.
-- `run_simulated_inversion.py` contains shared synthesizer, station, velocity,
-  and arrival-time helpers.
-- `synthetic_inversion_softdtw_test.py` contains the active `GSOTLikelihood`
-  and `SoftDTWLikelihood` implementations used by `run_inversion.py`.
-- `openswpc_tools/` contains OpenSWPC model/case/GF-library utilities.
+- `src_smc_mti/forward/` contains Axitra/OpenSWPC-GF synthesizers and
+  arrival-time helpers.
+- `src_smc_mti/io/` contains station, velocity-model, and observation loaders.
+- `src_smc_mti/waveform_likelihoods.py` contains the active `GSOTLikelihood`,
+  `SoftDTWLikelihood`, and `L2Likelihood` implementations.
+- `archive/legacy/run_simulated_inversion.py` and
+  `archive/legacy/synthetic_inversion_softdtw_test.py` preserve legacy
+  synthetic/demo workflows outside the active top-level scripts.
+- `generate_axitra_random_waveforms.py` provides a quick Axitra synthetic
+  plotting diagnostic for CAPE events.
+- `openswpc_tools/` contains optional OpenSWPC model/case/GF-library utilities.
 - `src_smc_mti/` contains local Tape moment tensor, polarity, likelihood, and
   plotting helpers.
 - `docs/` contains copied workflow notes from the original mixed project.
@@ -27,9 +48,10 @@ Keep these outside Git or add them locally when running:
 - `MSEED/<event_id>/` with `*.mseed`, `picks.dat`, and optionally `invdata.pkl`
 - `stationxml/`
 - `FORGE_catalog.csv`
-- `forge.tvel`
-- packed OpenSWPC GF library, for example `o20/gf_library_f100_dx20.npz`
-- OpenSWPC executable and model files if regenerating the GF library
+- `cape.tvel`
+- Axitra built at `../axitra/MOMENT_DISP_F90_OPENMP/src`
+- packed OpenSWPC GF library only when using `--synthetic-backend openswpc_gf`
+- OpenSWPC executable and model files only if regenerating the GF library
 
 ## Prepare event data
 
@@ -43,34 +65,63 @@ python prepare_invdata.py \
 
 This writes `MSEED/1111911135/invdata.pkl`.
 
-## Run inversion with OpenSWPC GF backend
+## Run CAPE Inversion With Axitra
+
+First prepare the CAPE waveform data if needed:
+
+```bash
+python prepare_cape_invdata.py eq02387
+```
+
+Then generate or refresh reusable Axitra Green functions:
+
+```bash
+python generate_cape_axitra_greens.py eq02387
+```
+
+The default Green-function directory is
+`cape_events/eq02387/axitra_greens/`. Inversion runs require that directory to
+exist and match the current stations, source, velocity model, duration, `fmax`,
+and source time.
+
+```bash
+python run_cape_inversion.py eq02387 \
+  --n-particles 500 \
+  --n-stages 20
+```
+
+The CAPE wrapper defaults to Axitra, all three `ZNE` components, pick-centered
+synthetic windows, `duration=7 s`, `fmax=30 Hz`, and `2-30 Hz` CAPE filters.
+For a quick smoke test, use `--n-particles 30 --n-stages 2`.
+More detailed CAPE notes are in `docs/CAPE_WORKFLOW.md`.
+
+The wrapper expands to `run_inversion.py --synthetic-backend axitra`. A direct
+equivalent is:
 
 ```bash
 python run_inversion.py \
-  --event-dir MSEED/1111911135 \
-  --stations-dir stationxml \
-  --velocity-model forge.tvel \
-  --synthetic-backend openswpc_gf \
-  --openswpc-gf-file o20/gf_library_f100_dx20.npz \
+  --event-dir cape_events/eq02387 \
+  --stations-dir stations \
+  --velocity-model cape.tvel \
+  --synthetic-backend axitra \
+  --axitra-greens-dir cape_events/eq02387/axitra_greens \
   --likelihood gsot \
   --sampler smc \
   --n-particles 500 \
   --n-stages 20 \
-  --phase-window-p-len 0.05 \
-  --phase-window-s-len 0.05 \
-  --synthetic-phase-window-p-len 0.12 \
-  --synthetic-phase-window-s-len 0.2 \
-  --auto-time-steps \
-  --time-steps 70 \
-  --source-target-freq-hz 100 \
-  --use-ray-polarity \
-  --polarity-phases PZ \
-  --polarity-weight 1.0 \
-  --gsot-ratio-weight 0 \
-  --bp-p-low 10 --bp-p-high 240 \
-  --bp-s-low 10 --bp-s-high 200 \
-  --l2norm-weight 0.01 \
-  --dc-only
+  --components PZ,SN,SE \
+  --duration 7.0 \
+  --fmax 30.0 \
+  --source-delay 0.0 \
+  --synthetic-window-source picks \
+  --phase-window-p-len 0.30 \
+  --phase-window-s-len 0.60 \
+  --synthetic-phase-window-p-len 0.30 \
+  --synthetic-phase-window-s-len 0.60 \
+  --time-steps 100 \
+  --bp-p-low 2 --bp-p-high 30 \
+  --bp-s-low 2 --bp-s-high 30 \
+  --source-target-freq-hz 30
 ```
 
 Expected output files include:
@@ -79,9 +130,10 @@ Expected output files include:
 - `bb_map_<event>_<likelihood>_<sampler>_f<freq>.png`
 - `bb_medoid_<event>_<likelihood>_<sampler>_f<freq>.png`
 
-For a quick smoke test, use `--n-particles 30 --n-stages 2`.
+## Optional OpenSWPC GF Workflow
 
-## OpenSWPC GF workflow
+OpenSWPC GF generation is retained as a reference path, but it is no longer the
+default CAPE workflow.
 
 1. Crop the FORGE model:
 

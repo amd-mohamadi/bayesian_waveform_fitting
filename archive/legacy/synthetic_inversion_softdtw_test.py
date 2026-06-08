@@ -1,6 +1,12 @@
 """
 Synthetic inversion test with noisy and shifted observations.
 
+LEGACY SCRIPT:
+- Active GSOT/Soft-DTW/posterior/beachball helpers have been extracted to
+  src_smc_mti package modules.
+- Keep this file only as an old synthetic demo/test workflow until it is moved
+  to tests/examples or archived.
+
 This mirrors synthetic_inversion_test.py, but replaces the Siamese likelihood
 with a normalized Soft-DTW likelihood.
 """
@@ -40,17 +46,15 @@ except Exception:
     except Exception:
         _AmplitudePlot = None
 
-from run_simulated_inversion import (  # noqa: E402
-    FastSynthesizer,
-    L2Likelihood,
-    MT33_MT6,
-    Tape_MT33,
-    calculate_arrival_time,
-    kagan_angle_deg,
+from src_smc_mti.forward import FastSynthesizer, calculate_arrival_time  # noqa: E402
+from src_smc_mti.io import (  # noqa: E402
     load_observation,
     load_stations_from_xml,
     load_velocity_model,
 )
+from src_smc_mti.moment_metrics import kagan_angle_deg  # noqa: E402
+from src_smc_mti.tape import MT33_MT6, Tape_MT33  # noqa: E402
+from src_smc_mti.waveform_likelihoods import L2Likelihood  # noqa: E402
 
 
 def add_noise_and_shifts(observation, snr_min=5.0, snr_max=10.0, max_shift=12):

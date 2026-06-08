@@ -164,7 +164,7 @@ Practical takeaway:
 
 The GSOT and L2 likelihoods previously aggregated per-trace costs with a flat mean or median across all `nsta * ncomp` traces. Poorly-fitting station-channels (due to 3D velocity model inaccuracies, site effects, or instrument issues) dragged the posterior away from the true solution.
 
-New features added to `GSOTLikelihood` (`synthetic_inversion_softdtw_test.py`) and `run_inversion.py`:
+New features added to `GSOTLikelihood` (`src_smc_mti/waveform_likelihoods.py`) and `run_inversion.py`:
 
 - `GSOTLikelihood.compute_per_trace_cost()` — returns per-trace GSOT cost `(B, ntr)` before aggregation.
 - `GSOTLikelihood.compute_log_likelihood(..., trace_weights=)` — optional per-trace weight vector; when provided, uses weighted-mean aggregation instead of flat mean/median.

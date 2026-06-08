@@ -14,23 +14,20 @@ from matplotlib.lines import Line2D
 from obspy import UTCDateTime
 from tqdm import tqdm
 
-from run_simulated_inversion import (
+from src_smc_mti.forward import (
     FastSynthesizer,
-    L2Likelihood,
     OpenSWPCGFSynthesizer,
-    Tape_MT6,
-    Tape_MT33,
     calculate_arrival_time,
-    load_stations_from_xml,
-    load_velocity_model,
 )
-from synthetic_inversion_softdtw_test import (
+from src_smc_mti.io import load_stations_from_xml, load_velocity_model
+from src_smc_mti.tape import Tape_MT6, Tape_MT33
+from src_smc_mti.waveform_likelihoods import (
     GSOTLikelihood,
+    L2Likelihood,
     SoftDTWLikelihood,
-    decode_unit_to_physical,
-    plot_amplitude_beachball,
-    weighted_posterior_medoid,
 )
+from src_smc_mti.inversion import decode_unit_to_physical, weighted_posterior_medoid
+from src_smc_mti.plot.beachball import plot_amplitude_beachball
 from src_smc_mti.data_loader import read_data
 from src_smc_mti.data_prep import polarity_matrix
 from src_smc_mti.likelihoods import polarity_ln_pdf
@@ -214,6 +211,24 @@ def _adaptive_weights_from_trace_cost(
     return w
 
 
+def _apply_trace_mask_to_weights(
+    weights: np.ndarray | None, trace_mask: np.ndarray
+) -> np.ndarray | None:
+    mask = np.asarray(trace_mask, dtype=bool).reshape(-1)
+    if np.all(mask) and weights is None:
+        return None
+    base = np.ones(mask.shape[0], dtype=np.float64) if weights is None else weights
+    masked = np.asarray(base, dtype=np.float64).reshape(-1) * mask.astype(np.float64)
+    return _normalize_trace_weights(masked)
+
+
+def _apply_trace_mask_to_batch(
+    synthetics: np.ndarray, trace_mask_2d: np.ndarray
+) -> np.ndarray:
+    mask = np.asarray(trace_mask_2d, dtype=bool)
+    return synthetics * mask[None, :, :, None].astype(synthetics.dtype)
+
+
 def _print_trace_weight_summary(
     trace_weights: np.ndarray,
     station_ids: list[str],
@@ -319,6 +334,66 @@ def build_phase_window_cache_dual(
     }
 
 
+def build_phase_window_cache_from_picks(
+    invdata,
+    station_ids,
+    duration,
+    npts,
+    p_window_len,
+    s_window_len,
+    time_steps=70,
+    p_bp_low=None,
+    p_bp_high=None,
+    s_bp_low=None,
+    s_bp_high=None,
+    bp_order=4,
+):
+    origin = invdata.get("source", {}).get("origin_time")
+    if not origin:
+        raise ValueError(
+            "Pick-centered synthetic windows require source.origin_time in invdata"
+        )
+    origin_time = UTCDateTime(origin)
+    picks = invdata.get("picks", {})
+
+    nsta = len(station_ids)
+    dt = duration / float(npts)
+    p_win_samples = int(round(float(p_window_len) / dt))
+    s_win_samples = int(round(float(s_window_len) / dt))
+    p_half = 0.5 * float(p_window_len)
+    s_half = 0.5 * float(s_window_len)
+
+    p_idx = np.zeros(nsta, dtype=np.int32)
+    s_idx = np.zeros(nsta, dtype=np.int32)
+    for i, sid in enumerate(station_ids):
+        sta_picks = picks.get(sid, {})
+        p_pick = sta_picks.get("P")
+        if p_pick is None:
+            raise ValueError(f"Missing P pick for station {sid}")
+        p_center = UTCDateTime(p_pick) - origin_time
+        s_pick = sta_picks.get("S")
+        s_center = p_center if s_pick is None else UTCDateTime(s_pick) - origin_time
+        p_idx[i] = int(np.floor((float(p_center) - p_half) / dt))
+        s_idx[i] = int(np.floor((float(s_center) - s_half) / dt))
+
+    return {
+        "p_idx": p_idx,
+        "s_idx": s_idx,
+        "npts": int(npts),
+        "time_steps": int(time_steps),
+        "p_win_samples": int(max(1, p_win_samples)),
+        "s_win_samples": int(max(1, s_win_samples)),
+        "taper": np.hanning(int(time_steps)).astype(np.float32),
+        "p_window_len": float(p_window_len),
+        "s_window_len": float(s_window_len),
+        "p_bp_low": p_bp_low,
+        "p_bp_high": p_bp_high,
+        "s_bp_low": s_bp_low,
+        "s_bp_high": s_bp_high,
+        "bp_order": int(bp_order),
+    }
+
+
 def extract_phase_windows_batch_cached_dual(waveforms, cache):
     bsz, nsta, _, npts = waveforms.shape
     if npts != cache["npts"]:
@@ -394,6 +469,7 @@ def build_observation_windows(invdata: dict, args):
     nsta = len(station_ids)
     tsteps = int(args.time_steps)
     obs = np.zeros((nsta, 3, tsteps), dtype=np.float32)
+    obs_mask = np.zeros((nsta, 3), dtype=bool)
     keep_ids = []
 
     p_len = float(args.phase_window_p_len)
@@ -421,17 +497,25 @@ def build_observation_windows(invdata: dict, args):
             comps["E"], fs, args, bp_low=args.bp_s_low, bp_high=args.bp_s_high
         )
 
-        p_time = UTCDateTime(picks[sid]["P"])
-        s_time = UTCDateTime(picks[sid]["S"])
+        p_pick = picks[sid].get("P")
+        if p_pick is None:
+            continue
+        s_pick = picks[sid].get("S")
+        p_time = UTCDateTime(p_pick)
 
         p_samples = int(round(p_len / dt))
         s_samples = int(round(s_len / dt))
         p_start = int(np.floor((p_time - t0 - 0.5 * p_len) / dt))
-        s_start = int(np.floor((s_time - t0 - 0.5 * s_len) / dt))
 
         z_win = _extract_centered_window(z, p_start, p_samples)
-        n_win = _extract_centered_window(n, s_start, s_samples)
-        e_win = _extract_centered_window(e, s_start, s_samples)
+        if s_pick is not None:
+            s_time = UTCDateTime(s_pick)
+            s_start = int(np.floor((s_time - t0 - 0.5 * s_len) / dt))
+            n_win = _extract_centered_window(n, s_start, s_samples)
+            e_win = _extract_centered_window(e, s_start, s_samples)
+        else:
+            n_win = np.zeros(s_samples, dtype=np.float32)
+            e_win = np.zeros(s_samples, dtype=np.float32)
 
         if p_samples != tsteps:
             z_win = scipy.signal.resample(z_win, tsteps).astype(np.float32)
@@ -444,11 +528,16 @@ def build_observation_windows(invdata: dict, args):
         obs[i, 0] = z_win
         obs[i, 1] = n_win
         obs[i, 2] = e_win
+        obs_mask[i, 0] = True
+        if s_pick is not None:
+            obs_mask[i, 1] = True
+            obs_mask[i, 2] = True
 
     if not keep_ids:
         raise RuntimeError("No valid station windows were built from invdata")
 
     obs = obs[: len(keep_ids)]
+    obs_mask = obs_mask[: len(keep_ids)]
     if args.apply_window_taper:
         taper = np.hanning(tsteps).astype(np.float32)
         obs *= taper[None, None, :]
@@ -456,19 +545,25 @@ def build_observation_windows(invdata: dict, args):
         max_vals = np.max(np.abs(obs), axis=(1, 2), keepdims=True)
         obs = np.divide(obs, max_vals, out=np.zeros_like(obs), where=max_vals > 1e-9)
 
-    return obs, keep_ids
+    return obs, keep_ids, obs_mask
 
 
 def select_station_geometry(stations_all, codes_all, station_ids):
     code_to_idx = {str(c): i for i, c in enumerate(codes_all)}
+    station_code_to_idx = {}
+    for i, c in enumerate(codes_all):
+        parts = str(c).split(".")
+        if len(parts) > 1:
+            station_code_to_idx.setdefault(parts[1], i)
     rows = []
     out_ids = []
     for sid in station_ids:
         parts = sid.split(".")
         code = parts[1] if len(parts) > 1 else sid
-        if code not in code_to_idx:
+        idx = code_to_idx.get(sid, code_to_idx.get(code, station_code_to_idx.get(code)))
+        if idx is None:
             continue
-        src = stations_all[code_to_idx[code]]
+        src = stations_all[idx]
         rows.append([len(rows) + 1, float(src[1]), float(src[2]), float(src[3])])
         out_ids.append(sid)
     if not rows:
@@ -859,6 +954,12 @@ def main():
         default=None,
         help="Path to packed OpenSWPC GF NPZ file (required for --synthetic-backend openswpc_gf)",
     )
+    parser.add_argument(
+        "--axitra-greens-dir",
+        type=str,
+        default=None,
+        help="Directory for persistent Axitra Green's functions. If metadata matches, existing Green's functions are reused.",
+    )
     parser.add_argument("--sampler", type=str, choices=["smc", "cmaes"], default="smc")
     parser.add_argument(
         "--likelihood", type=str, choices=["softdtw", "gsot", "l2"], default="gsot"
@@ -905,6 +1006,12 @@ def main():
         type=float,
         default=None,
         help="Synthetic-only S window length (s). If unset, uses --phase-window-s-len",
+    )
+    parser.add_argument(
+        "--synthetic-window-source",
+        choices=["velocity", "picks"],
+        default="velocity",
+        help="Center synthetic phase windows from 1D velocity predictions or observed pick offsets",
     )
     parser.add_argument("--time-steps", type=int, default=70)
     parser.add_argument(
@@ -1319,7 +1426,7 @@ def main():
     source_loc = (float(source["x"]), float(source["y"]), float(source["z"]))
     m0 = 10 ** (1.5 * float(source["mw"]) + 9.1)
 
-    obs, obs_station_ids = build_observation_windows(invdata, args)
+    obs, obs_station_ids, obs_trace_mask = build_observation_windows(invdata, args)
     stations_all, codes_all, _, _ = load_stations_from_xml(args.stations_dir)
     stations_sel, geo_station_ids = select_station_geometry(
         stations_all, codes_all, obs_station_ids
@@ -1327,8 +1434,17 @@ def main():
 
     idx_map = [obs_station_ids.index(sid) for sid in geo_station_ids]
     obs = obs[idx_map]
+    obs_trace_mask = obs_trace_mask[idx_map]
     obs = obs[:, comp_indices, :]
+    obs_trace_mask = obs_trace_mask[:, comp_indices]
     station_ids = geo_station_ids
+    trace_mask_flat = obs_trace_mask.reshape(-1)
+    n_missing_traces = int(np.sum(~trace_mask_flat))
+    if n_missing_traces:
+        print(
+            f"Trace mask enabled: active={int(np.sum(trace_mask_flat))}/"
+            f"{trace_mask_flat.size}, missing={n_missing_traces}"
+        )
 
     ratio_targets, ratio_valid = build_observed_ratio_targets(invdata, station_ids)
     n_ratio_valid = int(np.sum(np.all(ratio_valid, axis=1)))
@@ -1366,6 +1482,9 @@ def main():
             weights_cfg=weights_cfg,
             station_ids=station_ids,
             comp_tokens=comp_tokens,
+        )
+        manual_trace_weights = _apply_trace_mask_to_weights(
+            manual_trace_weights, trace_mask_flat
         )
         print(f"Manual station-channel weights loaded from {weights_path}")
         _print_trace_weight_summary(
@@ -1425,10 +1544,17 @@ def main():
             raise ValueError("--source-target-freq-hz must be > 0")
         synth_t0 = 1.0 / (np.pi * float(args.source_target_freq_hz))
 
-    print(
-        f"Synthetic source settings: target_freq={args.source_target_freq_hz:.3f} Hz, "
-        f"t0={synth_t0:.6f} s, delay={args.source_delay:.4f} s"
-    )
+    if args.synthetic_backend == "openswpc_gf":
+        print(
+            "Synthetic source settings: using precomputed OpenSWPC GF source; "
+            f"--source-target-freq-hz is ignored by this backend, "
+            "waveform source_delay is not applied"
+        )
+    else:
+        print(
+            f"Synthetic source settings: target_freq={args.source_target_freq_hz:.3f} Hz, "
+            f"t0={synth_t0:.6f} s, delay={args.source_delay:.4f} s"
+        )
 
     if args.likelihood == "softdtw":
         likelihood_model = SoftDTWLikelihood(
@@ -1473,7 +1599,14 @@ def main():
     )
 
     if args.synthetic_backend == "axitra":
-        synthesizer = FastSynthesizer(velocity_model, stations_sel, source_loc)
+        synthesizer = FastSynthesizer(
+            velocity_model,
+            stations_sel,
+            source_loc,
+            work_dir=args.axitra_greens_dir,
+            cache_id=1,
+            generate_if_missing=False,
+        )
         synthesizer.duration = float(args.duration)
         synthesizer.fmax = float(args.fmax)
         synthesizer.t0 = float(synth_t0)
@@ -1495,22 +1628,54 @@ def main():
         print(f"Using OpenSWPC GF backend: {args.openswpc_gf_file}")
     if synthesizer.ap is None:
         raise RuntimeError("Failed to initialize synthesizer")
-    phase_cache = build_phase_window_cache_dual(
-        stations=stations_sel,
-        source_loc=source_loc,
-        velocity_model=velocity_model,
-        duration=float(args.duration),
-        npts=int(synthesizer.ap.npt),
-        p_window_len=float(args.synthetic_phase_window_p_len),
-        s_window_len=float(args.synthetic_phase_window_s_len),
-        source_delay=float(args.source_delay),
-        time_steps=args.time_steps,
-        p_bp_low=args.bp_p_low,
-        p_bp_high=args.bp_p_high,
-        s_bp_low=args.bp_s_low,
-        s_bp_high=args.bp_s_high,
-        bp_order=args.bp_order,
+    synthetic_duration = (
+        float(synthesizer.duration)
+        if args.synthetic_backend == "openswpc_gf"
+        else float(args.duration)
     )
+    if args.synthetic_backend == "openswpc_gf":
+        requested_duration = float(args.duration)
+        if abs(synthetic_duration - requested_duration) > max(
+            1e-6, 0.5 * synthesizer._dt
+        ):
+            print(
+                "OpenSWPC GF duration overrides --duration for synthetic windows: "
+                f"{synthetic_duration:.6f} s from GF metadata"
+            )
+    if args.synthetic_window_source == "picks":
+        phase_cache = build_phase_window_cache_from_picks(
+            invdata=invdata,
+            station_ids=station_ids,
+            duration=synthetic_duration,
+            npts=int(synthesizer.ap.npt),
+            p_window_len=float(args.synthetic_phase_window_p_len),
+            s_window_len=float(args.synthetic_phase_window_s_len),
+            time_steps=args.time_steps,
+            p_bp_low=args.bp_p_low,
+            p_bp_high=args.bp_p_high,
+            s_bp_low=args.bp_s_low,
+            s_bp_high=args.bp_s_high,
+            bp_order=args.bp_order,
+        )
+        print("Synthetic phase windows centered on observed pick offsets")
+    else:
+        phase_cache = build_phase_window_cache_dual(
+            stations=stations_sel,
+            source_loc=source_loc,
+            velocity_model=velocity_model,
+            duration=synthetic_duration,
+            npts=int(synthesizer.ap.npt),
+            p_window_len=float(args.synthetic_phase_window_p_len),
+            s_window_len=float(args.synthetic_phase_window_s_len),
+            source_delay=float(args.source_delay),
+            time_steps=args.time_steps,
+            p_bp_low=args.bp_p_low,
+            p_bp_high=args.bp_p_high,
+            s_bp_low=args.bp_s_low,
+            s_bp_high=args.bp_s_high,
+            bp_order=args.bp_order,
+        )
+        print("Synthetic phase windows centered on velocity-model arrivals")
 
     n_particles = args.n_particles
     best_ll = -np.inf
@@ -1523,6 +1688,7 @@ def main():
     trace_weights = (
         manual_trace_weights.copy() if manual_trace_weights is not None else None
     )
+    trace_weights = _apply_trace_mask_to_weights(trace_weights, trace_mask_flat)
 
     if args.sampler == "smc":
         particles = np.zeros((n_particles, 5))
@@ -1557,6 +1723,7 @@ def main():
                 raw_wfs, phase_cache
             )
             processed = processed_full[:, :, comp_indices, :]
+            processed = _apply_trace_mask_to_batch(processed, obs_trace_mask)
             if args.likelihood == "gsot":
                 log_weights = likelihood_model.compute_log_likelihood(
                     processed, obs, trace_weights=trace_weights
@@ -1621,6 +1788,9 @@ def main():
                             min_cost=float(args.adaptive_gsot_min_cost),
                             zero_below=float(args.adaptive_gsot_zero_below),
                             min_active=int(args.adaptive_gsot_min_active_traces),
+                        )
+                        trace_weights = _apply_trace_mask_to_weights(
+                            trace_weights, trace_mask_flat
                         )
                         n_active = int(np.sum(trace_weights > 0.0))
                         print(
@@ -1713,7 +1883,13 @@ def main():
                 raw_wfs, phase_cache
             )
             processed = processed_full[:, :, comp_indices, :]
-            log_like = likelihood_model.compute_log_likelihood(processed, obs)
+            processed = _apply_trace_mask_to_batch(processed, obs_trace_mask)
+            if args.likelihood == "gsot":
+                log_like = likelihood_model.compute_log_likelihood(
+                    processed, obs, trace_weights=trace_weights
+                )
+            else:
+                log_like = likelihood_model.compute_log_likelihood(processed, obs)
             if polarity_cfg is not None and polarity_cfg["weight"] != 0.0:
                 log_like = log_like + polarity_loglike_from_particles(
                     particles, polarity_cfg
@@ -1741,6 +1917,7 @@ def main():
                     sigma=args.l2norm_sigma,
                     weight=args.l2norm_weight,
                     aggregation=args.l2norm_aggregation,
+                    trace_weights=trace_weights,
                 )
             costs = -log_like
             counteval += lam
@@ -1846,7 +2023,7 @@ def main():
     )
     wf_plot = f"waveform_fit_{out_prefix}.png"
     best_for_plot = best_synthetic
-    include_mask_plot = None
+    include_mask_plot = obs_trace_mask.copy()
     if trace_weights is not None:
         include_mask_plot = (
             np.asarray(trace_weights, dtype=np.float64).reshape(

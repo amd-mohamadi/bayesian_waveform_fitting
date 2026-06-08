@@ -1,4 +1,5 @@
 import argparse
+import json
 import re
 from pathlib import Path
 import sys
@@ -9,9 +10,6 @@ from obspy import read
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from run_simulated_inversion import load_stations_from_xml
-
 
 FNAME_RE = re.compile(
     r"^(?P<title>.+)\.3d\.(?P<station>st\d+)\.(?P<quantity>[UV])(?P<comp>[xyz])\.sac$",
@@ -91,7 +89,14 @@ def main() -> None:
         "--case-dir", required=True, help="OpenSWPC case directory with Mxx/.../Mxy"
     )
     parser.add_argument(
-        "--stations-dir", required=True, help="StationXML directory used for inversion"
+        "--stations-dir",
+        default=None,
+        help="Deprecated fallback; station order is read from station_order.json",
+    )
+    parser.add_argument(
+        "--station-metadata",
+        default=None,
+        help="Path to station_order.json written by setup_single_source_case.py",
     )
     parser.add_argument("--output", required=True, help="Output NPZ file path")
     parser.add_argument(
@@ -105,6 +110,24 @@ def main() -> None:
     case_dir = Path(args.case_dir)
     if not case_dir.exists():
         raise FileNotFoundError(f"Case directory not found: {case_dir}")
+    metadata_path = (
+        Path(args.station_metadata)
+        if args.station_metadata is not None
+        else case_dir / "station_order.json"
+    )
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Station metadata not found: {metadata_path}. "
+            "Regenerate cases with setup_single_source_case.py."
+        )
+    with metadata_path.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    meta_stations = metadata.get("stations", [])
+    if not meta_stations:
+        raise ValueError(f"No stations listed in {metadata_path}")
+    meta_labels = [str(item["label"]).lower() for item in meta_stations]
+    meta_codes = [str(item["station_id"]) for item in meta_stations]
+    meta_coords = np.asarray([item["coord"] for item in meta_stations], dtype=np.float64)
 
     basis_arrays = []
     station_labels_ref = None
@@ -112,6 +135,11 @@ def main() -> None:
     npts_ref = None
     for basis in BASIS_ORDER:
         loaded = _load_basis_waveforms(case_dir, basis, args.quantity)
+        if loaded["stations"] != meta_labels:
+            raise ValueError(
+                f"Station labels in {basis} do not match {metadata_path}: "
+                f"{loaded['stations']} vs {meta_labels}"
+            )
         if station_labels_ref is None:
             station_labels_ref = loaded["stations"]
             dt_ref = loaded["dt"]
@@ -127,17 +155,6 @@ def main() -> None:
 
     gf_basis = np.stack(basis_arrays, axis=0)  # (6, N, 3, T)
 
-    stations_all, codes_all, _, _ = load_stations_from_xml(args.stations_dir)
-    stations_all = np.asarray(stations_all, dtype=np.float64)
-    if stations_all.shape[0] < len(station_labels_ref):
-        raise ValueError("StationXML count is smaller than OpenSWPC stXXX count")
-
-    # st001..stNN follow the order used to write stloc.xy in setup script,
-    # which uses load_stations_from_xml order.
-    n = len(station_labels_ref)
-    gf_station_coords = stations_all[:n, :]
-    gf_station_codes = np.asarray(codes_all[:n])
-
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -145,8 +162,8 @@ def main() -> None:
         gf_basis=gf_basis,
         basis_order=np.asarray(BASIS_ORDER),
         station_labels=np.asarray(station_labels_ref),
-        station_codes=gf_station_codes,
-        station_coords=gf_station_coords,
+        station_codes=np.asarray(meta_codes),
+        station_coords=meta_coords,
         dt=np.float32(dt_ref),
         npts=np.int32(npts_ref),
         quantity=np.asarray(args.quantity.upper()),

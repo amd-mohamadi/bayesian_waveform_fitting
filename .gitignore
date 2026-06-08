@@ -11,9 +11,14 @@ env/
 # Large local inputs and generated data
 MSEED/
 stationxml/
+stations/
+cape_events/
 openswpc_model/
 openswpc_cases/
+cape_events/*/openswpc_cases/
+cape_events/*/openswpc_lhm*/
 o20/
+picks_amp.csv
 *.npz
 *.h5
 *.hdf5
@@ -26,5 +31,17 @@ o20/
 *.pdf
 *.svg
 inversion_result/
+waveforms/
 logs/
 lightning_logs/
+CLEANUP_REDESIGN_PLAN.md
+FebMarch_catalog.csv
+
+cape.tvel
+findings.md
+plot_waveforms.ipynb
+progress.md
+SCRIPT_INVENTORY.md
+task_plan.md
+*.md
+*.dat

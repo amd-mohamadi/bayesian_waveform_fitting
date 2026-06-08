@@ -1,4 +1,5 @@
 import argparse
+import json
 import pickle
 from pathlib import Path
 import sys
@@ -9,16 +10,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from run_simulated_inversion import load_stations_from_xml
+from src_smc_mti.io import load_stations_from_xml
 
 
 BASIS_TO_MT = {
     "Mxx": (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     "Myy": (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
     "Mzz": (0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
-    "Myz": (0.0, 0.0, 0.0, 1.0, 0.0, 0.0),
-    "Mxz": (0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
     "Mxy": (0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    "Mxz": (0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+    "Myz": (0.0, 0.0, 0.0, 1.0, 0.0, 0.0),
 }
 
 
@@ -55,7 +56,9 @@ def _build_input_text(
     fq_max: float,
     trise: float,
     vcut: float,
+    write_displacement: bool,
 ):
+    sw_wav_u = ".true." if write_displacement else ".false."
     return (
         f"""
   title            = '{title}'
@@ -112,7 +115,7 @@ def _build_input_text(
   kdec             = 2
 
   sw_wav_v         = .true.
-  sw_wav_u         = .true.
+  sw_wav_u         = {sw_wav_u}
   sw_wav_stress    = .false.
   sw_wav_strain    = .false.
   ntdec_w          = 1
@@ -176,9 +179,38 @@ def _build_input_text(
     )
 
 
+def _select_stations(stations_all, codes_all, station_ids):
+    by_id = {str(code): i for i, code in enumerate(codes_all)}
+    by_station = {}
+    for i, code in enumerate(codes_all):
+        parts = str(code).split(".")
+        if len(parts) > 1:
+            by_station.setdefault(parts[1], i)
+
+    rows = []
+    ids = []
+    missing = []
+    for sid in station_ids:
+        parts = str(sid).split(".")
+        sta = parts[1] if len(parts) > 1 else str(sid)
+        idx = by_id.get(str(sid), by_station.get(sta))
+        if idx is None:
+            missing.append(str(sid))
+            continue
+        src = stations_all[idx]
+        rows.append([len(rows) + 1, float(src[1]), float(src[2]), float(src[3])])
+        ids.append(str(sid))
+
+    if missing:
+        raise RuntimeError(f"StationXML missing event station(s): {missing}")
+    if not rows:
+        raise RuntimeError("No event stations matched StationXML files")
+    return np.asarray(rows, dtype=float), ids
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Create OpenSWPC single-source run inputs for FORGE MT basis simulations"
+        description="Create OpenSWPC single-source run inputs for MT basis simulations"
     )
     parser.add_argument("--event-dir", required=True)
     parser.add_argument("--stations-dir", required=True)
@@ -196,19 +228,18 @@ def main():
     parser.add_argument("--fmax", type=float, default=200.0)
     parser.add_argument("--trise", type=float, default=0.001)
     parser.add_argument("--vcut", type=float, default=1.5)
+    parser.add_argument(
+        "--write-displacement",
+        action="store_true",
+        help="Also write displacement SAC traces. CAPE velocity-GF runs leave this off.",
+    )
     parser.add_argument("--nproc-x", type=int, default=2)
     parser.add_argument("--nproc-y", type=int, default=2)
     parser.add_argument("--ref-elevation", type=float, default=1650.0249)
-    parser.add_argument(
-        "--swpc-bin",
-        type=str,
-        default="swpc_3d.x",
-        help="OpenSWPC swpc_3d.x executable path written into run_all_basis.sh",
-    )
     args = parser.parse_args()
 
     event_dir = Path(args.event_dir)
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir).resolve()
     model_nc = Path(args.model_nc).resolve()
     inv_path = event_dir / "invdata.pkl"
     if not inv_path.exists():
@@ -224,7 +255,10 @@ def main():
     ref_e = float(source.get("easting", 334641.1891)) - sx_m
     ref_n = float(source.get("northing", 4263443.693)) - sy_m
 
-    stations, _, _, _ = load_stations_from_xml(args.stations_dir)
+    stations_all, codes_all, _, _ = load_stations_from_xml(args.stations_dir)
+    stations, station_ids = _select_stations(
+        stations_all, codes_all, invdata["station_ids"]
+    )
     x_sta = stations[:, 1].astype(float)
     y_sta = stations[:, 2].astype(float)
     z_sta = stations[:, 3].astype(float)
@@ -256,7 +290,18 @@ def main():
         raise ValueError(f"Unknown basis values: {bad}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    model_link = out_dir / "model.nc"
+    if model_link.exists() or model_link.is_symlink():
+        if model_link.is_symlink():
+            model_link.unlink()
+    if not model_link.exists():
+        try:
+            model_link.symlink_to(model_nc)
+        except OSError:
+            model_link = model_nc
+
     st_file = out_dir / "stloc.xy"
+    station_meta = []
     with st_file.open("w", encoding="utf-8") as f:
         f.write("# x(km) y(km) z(km) stnm zsw\n")
         for i in range(stations.shape[0]):
@@ -264,6 +309,28 @@ def main():
             f.write(
                 f"{x_sta[i] / 1000.0:10.5f} {y_sta[i] / 1000.0:10.5f} {z_sta[i] / 1000.0:10.5f} {stnm:>10s} dep\n"
             )
+            station_meta.append(
+                {
+                    "label": stnm,
+                    "station_id": station_ids[i],
+                    "coord": [
+                        int(i + 1),
+                        float(x_sta[i]),
+                        float(y_sta[i]),
+                        float(z_sta[i]),
+                    ],
+                }
+            )
+
+    metadata_file = out_dir / "station_order.json"
+    metadata = {
+        "station_file": str(st_file.resolve()),
+        "stations": station_meta,
+        "component_order": ["Z", "N", "E"],
+        "basis_order": list(BASIS_TO_MT.keys()),
+        "event_id": str(invdata.get("event_id", event_dir.name)),
+    }
+    metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     for basis in basis_list:
         basis_dir = out_dir / basis
@@ -281,10 +348,10 @@ def main():
         input_file = basis_dir / f"input_{basis}.inf"
         input_text = _build_input_text(
             title=f"forge_{basis}",
-            odir=(basis_dir / "out"),
-            station_file=st_file,
-            source_file=src_file,
-            model_nc=model_nc,
+            odir=Path("out"),
+            station_file=Path("../stloc.xy"),
+            source_file=Path(f"source_{basis}.dat"),
+            model_nc=Path("../model.nc") if model_link != model_nc else model_nc,
             ref_e=ref_e,
             ref_n=ref_n,
             ref_h=args.ref_elevation,
@@ -304,6 +371,7 @@ def main():
             fq_max=args.fmax,
             trise=args.trise,
             vcut=args.vcut,
+            write_displacement=bool(args.write_displacement),
         )
         input_file.write_text(input_text, encoding="utf-8")
 
@@ -314,7 +382,9 @@ def main():
     run_sh = out_dir / "run_all_basis.sh"
     with run_sh.open("w", encoding="utf-8") as f:
         f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
-        f.write(f'SWPC_BIN="{args.swpc_bin}"\n')
+        f.write(
+            'SWPC_BIN="/home/a-mohamdi/Projects/focal_inversion/openswpc/bin/swpc_3d.x"\n'
+        )
         for basis in basis_list:
             basis_path = (out_dir / basis).as_posix()
             f.write(f"echo 'Running {basis}'\n")
@@ -326,6 +396,8 @@ def main():
 
     print(f"Wrote OpenSWPC case directory: {out_dir}")
     print(f"Basis simulations: {basis_list}")
+    print(f"Stations: {len(station_ids)} written to {st_file}")
+    print(f"Station metadata: {metadata_file}")
     print(
         "Grid: "
         f"nx={nx}, ny={ny}, nz={nz}, dx={args.dx:.3f} km, dt={args.dt:.4f} s, nt={nt}"

@@ -1,6 +1,11 @@
 """
 Simulated Inversion using Pre-trained Siamese Model + Adaptive SMC.
 
+LEGACY SCRIPT:
+- Active reusable forward-model utilities have been extracted to src_smc_mti.
+- Keep this file only for the old standalone synthetic/Siamese workflow until
+  that workflow is archived or removed.
+
 DEBUG VERSION:
 - Option for L2 (least-squares) likelihood for comparison
 - Plots best-fit waveform vs observation
@@ -10,6 +15,7 @@ import numpy as np
 import h5py
 import torch
 import argparse
+import json
 import sys
 import os
 import tempfile
@@ -25,6 +31,10 @@ import glob
 import obspy
 import pyproj
 
+AXITRA_SRC = Path(__file__).resolve().parents[1] / "axitra" / "MOMENT_DISP_F90_OPENMP" / "src"
+if str(AXITRA_SRC) not in sys.path:
+    sys.path.append(str(AXITRA_SRC))
+
 try:
     from axitra import Axitra, moment
 except Exception:
@@ -34,13 +44,25 @@ except Exception:
 from src_smc_mti.tape import Tape_MT6, Tape_MT33, MT33_MT6
 
 
+def _station_id_from_xml(xml_file: str, net_code: str, sta_code: str, cha) -> str:
+    stem = Path(xml_file).stem
+    parts = stem.split(".")
+    if len(parts) >= 4 and parts[0] == net_code and parts[1] == sta_code:
+        return ".".join(parts[:4])
+
+    loc = getattr(cha, "location_code", "")
+    chan = getattr(cha, "code", "")
+    band = chan[:2] if len(chan) >= 2 else chan
+    return f"{net_code}.{sta_code}.{loc}.{band}"
+
+
 def load_stations_from_xml(
     station_xml_dir: Union[str, Path],
 ) -> Tuple[np.ndarray, List[str], float, float]:
     """
     Parse stationxml files and return:
       - stations array [idx, x_m, y_m, depth_m]
-      - station codes corresponding to rows
+      - station ids corresponding to rows
       - centroid x, centroid y
     """
     station_xml_dir = Path(station_xml_dir)
@@ -60,17 +82,12 @@ def load_stations_from_xml(
             continue
         for net in inv:
             for sta in net:
-                if net.code != "FO":
-                    continue
-                if not (
-                    sta.code.startswith("58")
-                    or sta.code.startswith("78")
-                    or sta.code.startswith("56")
-                ):
-                    continue
-                if sta.code in processed or len(sta) == 0:
+                if len(sta) == 0:
                     continue
                 cha = sta[0]
+                station_id = _station_id_from_xml(xml_file, net.code, sta.code, cha)
+                if station_id in processed:
+                    continue
                 try:
                     easting, northing = transformer(cha.longitude, cha.latitude)
                 except Exception:
@@ -83,8 +100,8 @@ def load_stations_from_xml(
                         float(cha.depth),
                     ]
                 )
-                codes.append(sta.code)
-                processed.add(sta.code)
+                codes.append(station_id)
+                processed.add(station_id)
                 idx += 1
 
     if not stations:
@@ -443,7 +460,16 @@ class FastSynthesizer:
     """Optimized synthesizer that pre-computes Green's functions once."""
 
     def __init__(
-        self, velocity_model, stations, source_loc, duration=1.0, fmax=500.0, t0=0.01
+        self,
+        velocity_model,
+        stations,
+        source_loc,
+        duration=1.0,
+        fmax=500.0,
+        t0=0.01,
+        work_dir=None,
+        cache_id=2387,
+        generate_if_missing=True,
     ):
         self.velocity_model = velocity_model
         self.stations = stations
@@ -451,11 +477,62 @@ class FastSynthesizer:
         self.duration = duration
         self.fmax = fmax
         self.t0 = t0
+        self.work_dir = Path(work_dir) if work_dir is not None else None
+        self.cache_id = int(cache_id)
+        self.generate_if_missing = bool(generate_if_missing)
         self.axpath = str(AXITRA_SRC)
 
         self.ap = None
         self._temp_dir = None
         self._orig_dir = None
+
+    def _cache_metadata(self, sources: np.ndarray) -> dict:
+        return {
+            "backend": "axitra",
+            "cache_id": self.cache_id,
+            "duration": float(self.duration),
+            "fmax": float(self.fmax),
+            "t0": float(self.t0),
+            "axpath": self.axpath,
+            "velocity_model": np.asarray(self.velocity_model, dtype=float).tolist(),
+            "stations": np.asarray(self.stations, dtype=float).tolist(),
+            "sources": np.asarray(sources, dtype=float).tolist(),
+        }
+
+    def _cache_status(self, metadata_path: Path, metadata: dict) -> tuple[bool, str]:
+        if not metadata_path.exists():
+            return False, f"missing metadata file {metadata_path}"
+        data_file = metadata_path.parent / f"axi_{self.cache_id}.data"
+        res_file = metadata_path.parent / f"axi_{self.cache_id}.res"
+        if (
+            not data_file.exists()
+            or not res_file.exists()
+            or data_file.stat().st_size == 0
+            or res_file.stat().st_size == 0
+        ):
+            return False, (
+                f"missing or empty Axitra cache files axi_{self.cache_id}.data/"
+                f"axi_{self.cache_id}.res in {metadata_path.parent}"
+            )
+        with metadata_path.open("r", encoding="utf-8") as f:
+            old_metadata = json.load(f)
+        if old_metadata != metadata:
+            return False, f"metadata in {metadata_path} does not match this run"
+        return True, "ok"
+
+    def _cache_is_valid(self, metadata_path: Path, metadata: dict) -> bool:
+        valid, _ = self._cache_status(metadata_path, metadata)
+        return valid
+
+    def _cache_result_exists(self, run_dir: Path) -> bool:
+        data_file = run_dir / f"axi_{self.cache_id}.data"
+        res_file = run_dir / f"axi_{self.cache_id}.res"
+        return (
+            data_file.exists()
+            and res_file.exists()
+            and data_file.stat().st_size > 0
+            and res_file.stat().st_size > 0
+        )
 
     def setup(self):
         """Compute Green's functions (run once)."""
@@ -471,9 +548,37 @@ class FastSynthesizer:
             dtype=float,
         )
 
-        self._temp_dir = tempfile.mkdtemp()
+        if self.work_dir is None:
+            self._temp_dir = tempfile.mkdtemp()
+            run_dir = Path(self._temp_dir)
+        else:
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            run_dir = self.work_dir
         self._orig_dir = os.getcwd()
-        os.chdir(self._temp_dir)
+        os.chdir(run_dir)
+
+        metadata = self._cache_metadata(sources)
+        metadata_path = run_dir / "axitra_greens_metadata.json"
+        if self.work_dir is not None:
+            cache_valid, cache_reason = self._cache_status(metadata_path, metadata)
+        else:
+            cache_valid, cache_reason = False, "no persistent work_dir"
+
+        if self.work_dir is not None and cache_valid:
+            print(f"Loading Axitra Green's functions from {run_dir}")
+            self.ap = Axitra.read(suffix=str(self.cache_id), axpath=self.axpath)
+            if self.ap is None:
+                raise RuntimeError(f"Failed to load Axitra Green's functions from {run_dir}")
+            self.ap.id = self.cache_id
+            self.ap.sid = f"axi_{self.cache_id}"
+            return
+
+        if self.work_dir is not None and not self.generate_if_missing:
+            raise RuntimeError(
+                "Required Axitra Green's functions are missing or stale: "
+                f"{cache_reason}. Run generate_cape_axitra_greens.py for this event "
+                f"or pass a matching --axitra-greens-dir."
+            )
 
         print("Computing Green's functions (one-time cost)...")
         t0 = time.time()
@@ -494,8 +599,17 @@ class FastSynthesizer:
                 xl=0.0,
                 latlon=False,
                 axpath=self.axpath,
+                id=self.cache_id if self.work_dir is not None else None,
             )
             self.ap = moment.green(self.ap)
+            if self.work_dir is not None and not self._cache_result_exists(run_dir):
+                raise RuntimeError(
+                    f"Axitra Green-function generation failed in {run_dir}; "
+                    f"missing or empty axi_{self.cache_id}.res"
+                )
+            if self.work_dir is not None:
+                with metadata_path.open("w", encoding="utf-8") as f:
+                    json.dump(metadata, f, indent=2, sort_keys=True)
         finally:
             os.dup2(old_stdout, 1)
             os.dup2(old_stderr, 2)
@@ -583,10 +697,35 @@ class OpenSWPCGFSynthesizer:
         gf_basis = np.asarray(data["gf_basis"], dtype=np.float32)
         station_coords = np.asarray(data["station_coords"], dtype=float)
         dt = float(np.asarray(data["dt"]).reshape(()))
+        basis_order = (
+            [str(x) for x in np.asarray(data["basis_order"])]
+            if "basis_order" in data.files
+            else []
+        )
+        component_order = (
+            [str(x) for x in np.asarray(data["component_order"])]
+            if "component_order" in data.files
+            else []
+        )
+        quantity = (
+            str(np.asarray(data["quantity"]).reshape(()))
+            if "quantity" in data.files
+            else ""
+        )
 
         if gf_basis.ndim != 4 or gf_basis.shape[0] != 6 or gf_basis.shape[2] != 3:
             raise ValueError(
                 f"Invalid gf_basis shape: {gf_basis.shape}, expected (6,N,3,T)"
+            )
+        if basis_order != ["Mxx", "Myy", "Mzz", "Mxy", "Mxz", "Myz"]:
+            raise ValueError(f"Unexpected OpenSWPC GF basis_order: {basis_order}")
+        if component_order != ["Z", "N", "E"]:
+            raise ValueError(
+                f"Unexpected OpenSWPC GF component_order: {component_order}"
+            )
+        if quantity.upper() != "V":
+            raise ValueError(
+                f"OpenSWPC GF library must contain velocity, got {quantity}"
             )
 
         req_xyz = self.stations[:, 1:4]
@@ -598,6 +737,7 @@ class OpenSWPCGFSynthesizer:
 
         self._gf = gf_basis[:, np.asarray(idx, dtype=int), :, :]
         self._dt = dt
+        self.duration = dt * float(self._gf.shape[3])
         self.ap = SimpleNamespace(nstation=self._gf.shape[1], npt=self._gf.shape[3])
 
     def synthesize_batch(
@@ -623,12 +763,6 @@ class OpenSWPCGFSynthesizer:
         out = np.einsum("bq,qnct->bnct", coeffs, self._gf, optimize=True).astype(
             np.float32
         )
-
-        if source_delay != 0.0 and self._dt > 0:
-            shift = int(round(float(source_delay) / self._dt))
-            if shift > 0:
-                out = np.roll(out, shift, axis=3)
-                out[:, :, :, :shift] = 0.0
 
         return out
 
