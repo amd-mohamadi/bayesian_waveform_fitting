@@ -5,7 +5,7 @@ from jax import random
 import numpy as np
 
 from . import parameterization as P
-from .likelihood import waveform_loglike, waveform_loglike_autoshift
+from .likelihood import waveform_loglike, waveform_loglike_autoshift, polarity_loglike
 
 
 def make_data_shifts(data, lags):
@@ -24,17 +24,30 @@ def make_data_shifts(data, lags):
 
 def build_logdensities(dataset, mw_bounds=(4.0, 8.0), hp_bounds=(-2.0, 6.0), dc=False,
                        max_shift=0, lag_penalty_coef=0.0,
-                       gamma_beta=(3.0, 3.0), delta_beta=(3.0, 3.0)):
+                       gamma_beta=(3.0, 3.0), delta_beta=(3.0, 3.0), polarity=None):
     """Return (logprior_fn, loglikelihood_fn) over unconstrained particle dicts.
 
     max_shift>0 enables grond-style per-trace cross-correlation time-shift (in samples).
     gamma_beta/delta_beta are the (alpha, beta) of the Beta priors on the lune
     coordinates; symmetric values >1 regularise toward double couple (gamma=delta=0).
+    polarity (optional) adds a first-motion (Pz) probit term; a dict with keys
+    a_pol (P,6), inc (P,), sigma (float), weight (float).
     """
     basis = jnp.asarray(dataset.basis)        # (T, 6, N)
     weight = jnp.asarray(dataset.weights)     # (T, N) or (T, N, N)
     logdet = jnp.asarray(dataset.logdet)      # (T,)
     hp_index = jnp.asarray(dataset.hp_index)  # (T,) int
+
+    if polarity is not None:
+        a_pol = jnp.asarray(polarity["a_pol"])
+        pol_inc = jnp.asarray(polarity["inc"])
+        pol_sigma = float(polarity["sigma"])
+        pol_w = float(polarity["weight"])
+
+    def add_polarity(ll, m6):
+        if polarity is None:
+            return ll
+        return ll + pol_w * polarity_loglike(m6, a_pol, pol_sigma, pol_inc)
 
     if max_shift and max_shift > 0:
         lags = np.arange(-int(max_shift), int(max_shift) + 1)
@@ -44,15 +57,17 @@ def build_logdensities(dataset, mw_bounds=(4.0, 8.0), hp_bounds=(-2.0, 6.0), dc=
         def loglikelihood_fn(position):
             m6, _ = P.m6_physical(position, mw_bounds, dc=dc)
             hp = P.to_physical(position["hp"], *hp_bounds)
-            return waveform_loglike_autoshift(m6, basis, data_shifts, weight, logdet,
-                                              hp, hp_index, lag_penalty)
+            ll = waveform_loglike_autoshift(m6, basis, data_shifts, weight, logdet,
+                                            hp, hp_index, lag_penalty)
+            return add_polarity(ll, m6)
     else:
         data = jnp.asarray(dataset.data)
 
         def loglikelihood_fn(position):
             m6, _ = P.m6_physical(position, mw_bounds, dc=dc)
             hp = P.to_physical(position["hp"], *hp_bounds)   # (G,)
-            return waveform_loglike(m6, basis, data, weight, logdet, hp, hp_index)
+            ll = waveform_loglike(m6, basis, data, weight, logdet, hp, hp_index)
+            return add_polarity(ll, m6)
 
     def logprior_fn(position):
         lp = 0.0

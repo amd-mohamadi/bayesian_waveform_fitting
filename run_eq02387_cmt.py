@@ -11,6 +11,12 @@ Adapted from run_regional_cmt.py for a much smaller, local event. Differences:
     cross-correlation shift then aligns them. Cutting the synthetic on the pick
     instead would land its window off the synthetic arrival (flat traces).
   * Observed and synthetic are both velocity.
+  * Optional first-motion (Pz) polarity term: observed polarity comes from the
+    picker CSV (signed phase_polarity, sign=up/down, |.|=confidence); the synthetic
+    coefficient is read off the RAW GF basis at the modeled onset and scored with a
+    probit. Evaluated at the fixed onset, it is immune to the autoshift, so it stops
+    the shift from "cheating" by aligning onto an opposite-polarity cycle.
+    Controlled by --polarity-weight (0 disables) / --polarity-sigma.
 
 The invdata FORK S pick is a mispick (~6.4 s); it is overridden to 1.25 s after the
 origin -- the actual S arrival read off report/eq02387_picks_check.png.
@@ -36,6 +42,8 @@ PATHS = {
     "store_superdirs": [os.path.join(HERE, "gf_stores")],
     "store_id": "forge_eq02387_qseis_pathavg_600m",
     "invdata": os.path.join(HERE, "cape_events", "eq02387", "invdata.pkl"),
+    "picks_file": os.path.join(HERE, "picks_amp.csv"),
+    "polarity_cache": os.path.join(HERE, "cape_events", "eq02387", "pz_polarity.csv"),
 }
 # grond DC reference solution (grond_eq02387_dc_reference_run.md) for comparison
 GROND_DC_REF = dict(strike=77.76, dip=87.65, rake=-24.06, mw=1.915)
@@ -163,6 +171,11 @@ def main():
     ap.add_argument("--max-shift-sec", type=float, default=0.05,
                     help="per-trace CC time-shift half-window in s (absorbs pick/model offset)")
     ap.add_argument("--lag-penalty", type=float, default=0.0)
+    # first-motion (Pz) polarity likelihood (real mode); weight 0 disables
+    ap.add_argument("--polarity-weight", type=float, default=1.0,
+                    help="scale of the Pz first-motion polarity log-likelihood (0 disables)")
+    ap.add_argument("--polarity-sigma", type=float, default=0.4,
+                    help="probit width on the unit-normalised radiation amplitude")
     # sampler
     ap.add_argument("--num-particles", type=int, default=600)
     ap.add_argument("--mcmc-steps", type=int, default=10)
@@ -181,7 +194,7 @@ def main():
     delta_beta = tuple(float(x) for x in args.delta_beta.split(","))
     exclude_set = {s.strip() for s in args.exclude.split(",") if s.strip()}
 
-    event, stations, observed, picks_rel, _ = invio.load_invdata(PATHS["invdata"])
+    event, stations, observed, picks_rel, raw = invio.load_invdata(PATHS["invdata"])
     # FORK invdata S pick is a mispick (~6.4 s); the true S is at 1.25 s after origin
     # (read off report/eq02387_picks_check.png).
     if FORK in picks_rel:
@@ -207,6 +220,26 @@ def main():
     basis_anchors = model_anchors(forward)
     print("windows: observed on picks, synthetic on modeled arrivals (CAP-style)")
 
+    # First-motion (Pz) polarity term (real mode only; synthetic recovery uses the
+    # waveform alone). Observed polarity comes from the picker CSV; the synthetic
+    # first-motion coefficient is read off the raw GF basis at the modeled onset.
+    polarity = None
+    if args.mode == "real" and args.polarity_weight > 0:
+        pol_by_station = invio.load_pz_polarity(
+            raw.get("event_id", "eq02387"), raw["station_ids"],
+            PATHS["picks_file"], PATHS["polarity_cache"])
+        polarity = ds.build_polarity_coeffs(forward, pol_by_station)
+        if polarity is None:
+            print("polarity: no observed Pz polarities found -> term disabled")
+        else:
+            polarity["sigma"] = args.polarity_sigma
+            polarity["weight"] = args.polarity_weight
+            print(f"\npolarity (Pz): {len(polarity['meta'])} picks, "
+                  f"sigma={args.polarity_sigma}, weight={args.polarity_weight}")
+            print(f"  {'station':10s}{'obs_pol':>8s}{'inc':>7s}")
+            for pm, inc in zip(polarity["meta"], polarity["inc"]):
+                print(f"  {pm['station']:10s}{pm['polarity']:+8.2f}{inc:7.3f}")
+
     m6_ref = m6_from_sdr_mw(**GROND_DC_REF)
     if args.mode == "synthetic":
         dataset = ds.build_dataset_synthetic_picks(
@@ -226,7 +259,7 @@ def main():
     logprior_fn, loglik_fn = M.build_logdensities(
         dataset, mw_bounds=mw_bounds, hp_bounds=hp_bounds, dc=args.dc,
         max_shift=max_shift, lag_penalty_coef=args.lag_penalty,
-        gamma_beta=gamma_beta, delta_beta=delta_beta)
+        gamma_beta=gamma_beta, delta_beta=delta_beta, polarity=polarity)
     if not args.dc:
         print(f"source-type prior: gamma~Beta{gamma_beta}, delta~Beta{delta_beta} (centred on DC)")
     key = jax.random.PRNGKey(args.seed)
@@ -242,6 +275,16 @@ def main():
                                     mw_bounds, hp_bounds, dc=args.dc)
     ref_label = "true" if args.mode == "synthetic" else "grond DC"
     mean_m6, mw_est, kagan = report(m6_ref, ref_label, posterior, result["weights"])
+
+    if polarity is not None:
+        m6n = mean_m6 / (np.linalg.norm(mean_m6) + 1e-30)
+        X = polarity["a_pol"] @ m6n            # signed by obs: >0 = predicted agrees
+        n_ok = int(np.sum(X > 0))
+        print(f"polarity check (posterior mean): {n_ok}/{len(X)} picks agree")
+        print(f"  {'station':10s}{'obs_pol':>8s}{'pred_X':>9s}  agree")
+        for pm, x in zip(polarity["meta"], X):
+            print(f"  {pm['station']:10s}{pm['polarity']:+8.2f}{x:+9.3f}  "
+                  f"{'yes' if x > 0 else 'NO'}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez(args.out, m6=posterior["m6"], weights=result["weights"],

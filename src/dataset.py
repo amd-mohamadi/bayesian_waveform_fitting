@@ -195,3 +195,47 @@ def build_dataset_real_picks(forward, observed, event_time, anchors, wins, filts
     weights, logdet = build_weights(noise_list, n_win, deltat, structure)
     hp_index, n_groups = _assign_groups(meta, group_by)
     return WaveformDataset(basis, np.stack(data), weights, logdet, hp_index, n_groups, meta)
+
+
+def build_polarity_coeffs(forward, pol_by_station, channel="Z", n_fm_sec=0.05):
+    """First-motion (Pz) polarity coefficients for the probit likelihood (Route B).
+
+    For each ``channel`` target whose station has an observed polarity, take the
+    RAW (unfiltered) basis column at the first-swing peak just after the modeled P
+    onset -- the bandpassed window flips the leading swing, so the unfiltered GF is
+    used here. The peak sample is located on the stacked basis amplitude (so it is
+    mechanism-independent), then folded with the observed polarity sign.
+
+    pol_by_station : {(net, sta, loc): signed polarity in [-1, 1]} (sign = up/down,
+                     |.| = pick confidence)
+
+    Returns dict(a_pol=(P,6) signed unit coeffs, inc=(P,) incorrect-pol prob,
+    meta=[{station, nslc, polarity}]) or None if no station has a polarity.
+    """
+    from pyrocko import orthodrome
+    raw = forward.raw_basis()
+    deltat = forward.deltat
+    n_fm = max(1, int(round(n_fm_sec / deltat)))
+    a_list, inc_list, meta = [], [], []
+    for jt, m in enumerate(forward.meta):
+        if m["nslc"][3] != channel:
+            continue
+        pol = pol_by_station.get(m["nslc"][:3])
+        if pol is None or pol == 0.0:
+            continue
+        st = m["station"]
+        dist = orthodrome.distance_accurate50m(forward.event.lat, forward.event.lon,
+                                               st.lat, st.lon)
+        tP = float(forward.store.t("anyP", (forward.event.depth, dist)))
+        B, tmin = raw[jt]["basis"], raw[jt]["tmin"]
+        k0 = int(round((tP - tmin) / deltat))
+        seg = B[:, k0:k0 + n_fm]
+        kfm = int(np.argmax(np.linalg.norm(seg, axis=0)))
+        a = B[:, k0 + kfm]
+        ahat = a / (np.linalg.norm(a) + 1e-30)
+        a_list.append((1.0 if pol > 0 else -1.0) * ahat)
+        inc_list.append(min(max((1.0 - abs(pol)) / 2.0, 0.0), 0.499))
+        meta.append({"station": st.station, "nslc": m["nslc"], "polarity": float(pol)})
+    if not a_list:
+        return None
+    return {"a_pol": np.array(a_list), "inc": np.array(inc_list), "meta": meta}

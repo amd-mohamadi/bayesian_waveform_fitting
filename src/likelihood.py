@@ -11,6 +11,7 @@ Cholesky-inverse weight W (so r^T Cd^-1 r = ||W r||^2), supplied by covariance.p
 This mirrors BEAT's ``multivariate_normal_chol``.
 """
 import jax.numpy as jnp
+from jax.scipy.special import erf
 
 LOG2PI = jnp.log(2.0 * jnp.pi)
 
@@ -72,3 +73,24 @@ def waveform_loglike_autoshift(m6, basis, data_shifts, weight, logdet, hp, hp_in
     quad_lag = jnp.sum(wr ** 2, axis=2) + lag_penalty[:, None]   # (L, T)
     quad = jnp.min(quad_lag, axis=0)               # (T,)  best alignment per trace
     return _assemble(quad, data_shifts.shape[2], logdet, hp, hp_index)
+
+
+def polarity_loglike(m6, a_pol, sigma, inc):
+    """First-motion (Pz) polarity log-likelihood -- probit model, Route B.
+
+    The autoshift waveform term can lower L2 misfit by sliding a synthetic onto an
+    opposite-polarity cycle; this term, evaluated at the fixed modeled onset, is
+    immune to that shift and penalises sign disagreement independently.
+
+    m6    : (6,)    NED moment tensor (any scale; normalised internally)
+    a_pol : (P, 6)  unit first-motion coefficients PRE-MULTIPLIED by the observed
+                    polarity sign, so X = a_pol @ (m6/||m6||) is positive when the
+                    predicted radiation agrees with the observed first motion.
+    sigma : float   probit width on the unit-normalised radiation amplitude
+    inc   : (P,)    per-pick incorrect-polarity probability (from pick confidence)
+    """
+    m6n = m6 / (jnp.sqrt(jnp.sum(m6 ** 2)) + 1e-30)
+    X = a_pol @ m6n                                       # (P,) signed radiation
+    base = 0.5 * (1.0 + erf(X / (jnp.sqrt(2.0) * sigma)))  # P(agree | mechanism)
+    p = inc + (1.0 - 2.0 * inc) * base
+    return jnp.sum(jnp.log(p + 1e-12))

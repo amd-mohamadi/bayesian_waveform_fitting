@@ -7,6 +7,8 @@ Event, pyrocko Stations (with Z/N/E channels), an {nslc: Trace} observed dict, a
 source-relative P/S pick offsets -- so windows can be anchored on the picks rather
 than on a velocity-model traveltime.
 """
+import csv
+import os
 import pickle
 from datetime import datetime, timezone
 
@@ -70,6 +72,55 @@ def load_invdata(path, depth_m=None):
             "s_score": pk.get("s_score"),
         }
     return event, stations, observed, picks_rel, d
+
+
+def load_pz_polarity(event_id, station_ids, picks_file="picks_amp.csv", cache_path=None):
+    """Observed P first-motion polarity per station (Route B).
+
+    The signed ``phase_polarity`` (in [-1, 1]; sign = up/down, |.| = confidence)
+    lives in the picker CSV the invdata was built from, but the prepared
+    invdata.pkl drops it. This reads the best Pz (fallback P) pick per station and
+    caches a small sidecar CSV next to the invdata, so the (large) picks file is
+    scanned only once. Returns {(net, sta, loc): polarity_float}.
+    """
+    if cache_path and os.path.exists(cache_path):
+        out = {}
+        with open(cache_path) as f:
+            for row in csv.DictReader(f):
+                net, sta, loc = row["station_id"].split(".")[:3]
+                out[(net, sta, loc)] = float(row["polarity"])
+        return out
+
+    import pandas as pd
+    want = set(station_ids)
+    best = {}  # sid -> (rank, polarity, phase_type, score)
+    for chunk in pd.read_csv(picks_file, chunksize=500000,
+                             dtype={"event_index": str, "station_id": str}):
+        sub = chunk[chunk["event_index"].str.strip().eq(str(event_id))]
+        if sub.empty:
+            continue
+        sub = sub[sub["phase_type"].isin(["Pz", "P"])]
+        for _, r in sub.iterrows():
+            sid = r["station_id"].strip()
+            if sid not in want:
+                continue
+            rank = (1 if r["phase_type"] == "Pz" else 0, float(r["phase_score"]))
+            if sid not in best or rank > best[sid][0]:
+                best[sid] = (rank, float(r["phase_polarity"]), r["phase_type"],
+                             float(r["phase_score"]))
+
+    out, rows = {}, []
+    for sid, (_, pol, ptype, score) in best.items():
+        net, sta, loc = sid.split(".")[:3]
+        out[(net, sta, loc)] = pol
+        rows.append((sid, pol, ptype, score))
+    if cache_path and rows:
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+        with open(cache_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["station_id", "polarity", "phase_type", "score"])
+            w.writerows(sorted(rows))
+    return out
 
 
 def to_zrt(event, stations, observed):
