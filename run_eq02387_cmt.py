@@ -1,0 +1,265 @@
+"""Waveform-fitting MT inversion for the small CAPE event eq02387 (Mw ~2).
+
+Adapted from run_regional_cmt.py for a much smaller, local event. Differences:
+  * Green's functions: the qseis store built from the CAPE path-averaged 1-D model
+    cape_pathavg_eq02387_600m.tvel (store id forge_eq02387_qseis_pathavg_600m).
+  * Data come from cape_events/eq02387/invdata.pkl (ENZ velocity traces), rotated
+    to ZRT (vertical/radial/transverse) before fitting.
+  * CAP-style windowing: the OBSERVED phase window is cut around the invdata pick
+    (P pick -> Z, S pick -> R & T), while the SYNTHETIC window is cut around the
+    modeled (store) arrival -- where the synthetic energy actually is. A per-trace
+    cross-correlation shift then aligns them. Cutting the synthetic on the pick
+    instead would land its window off the synthetic arrival (flat traces).
+  * Observed and synthetic are both velocity.
+
+The invdata FORK S pick is a mispick (~6.4 s); it is overridden to 1.25 s after the
+origin -- the actual S arrival read off report/eq02387_picks_check.png.
+
+Run from the repo root:
+    conda run -n pymc python run_eq02387_cmt.py --mode real
+    conda run -n pymc python run_eq02387_cmt.py --mode synthetic   # recovery test
+"""
+import argparse
+import os
+
+import numpy as np
+from pyrocko import moment_tensor as pmt
+
+from src import invdata as invio
+from src.forward import GFForward
+from src import dataset as ds
+from src import model as M
+from src.sampler import run_smc
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PATHS = {
+    "store_superdirs": [os.path.join(HERE, "gf_stores")],
+    "store_id": "forge_eq02387_qseis_pathavg_600m",
+    "invdata": os.path.join(HERE, "cape_events", "eq02387", "invdata.pkl"),
+}
+# grond DC reference solution (grond_eq02387_dc_reference_run.md) for comparison
+GROND_DC_REF = dict(strike=77.76, dip=87.65, rake=-24.06, mw=1.915)
+PHASE_OF = {"Z": "P", "R": "S", "T": "S"}
+FORK = ("UU", "FORK", "01")
+
+
+def m6_to_mt(m6):
+    return pmt.MomentTensor(mnn=m6[0], mee=m6[1], mdd=m6[2], mne=m6[3], mnd=m6[4], med=m6[5])
+
+
+def m6_from_sdr_mw(strike, dip, rake, mw):
+    m = pmt.MomentTensor(strike=strike, dip=dip, rake=rake, magnitude=mw).m()  # NED 3x3
+    return np.array([m[0, 0], m[1, 1], m[2, 2], m[0, 1], m[0, 2], m[1, 2]])
+
+
+def report(m6_ref, ref_label, posterior, weights):
+    m6 = posterior["m6"]
+    mean_m6 = np.average(m6, axis=0, weights=weights)
+    mt_est = m6_to_mt(mean_m6)
+    s1, d1, r1 = mt_est.both_strike_dip_rake()[0]
+    mw_est = float(np.average(posterior["mw"], weights=weights))
+    mw_std = float(np.sqrt(np.average((posterior["mw"] - mw_est) ** 2, weights=weights)))
+    kagan = None
+    print("\n================ POSTERIOR ================")
+    print(f"estimated  strike={s1:6.1f}  dip={d1:5.1f}  rake={r1:6.1f}  Mw={mw_est:.2f} +/- {mw_std:.2f}")
+    if m6_ref is not None:
+        mt_ref = m6_to_mt(m6_ref)
+        s1t, d1t, r1t = mt_ref.both_strike_dip_rake()[0]
+        kagan = pmt.kagan_angle(mt_ref, mt_est)
+        print(f"{ref_label:10s} strike={s1t:6.1f}  dip={d1t:5.1f}  rake={r1t:6.1f}  Mw={mt_ref.magnitude:.2f}")
+        print(f"Kagan angle (mechanism error vs {ref_label}): {kagan:.1f} deg")
+    print("===========================================\n")
+    return mean_m6, mw_est, kagan
+
+
+def build_window_specs(forward, picks_rel, args, exclude_set):
+    """Per-target (aligned to forward.meta) anchors/windows/filters + a pruned observed.
+
+    Returns (anchors, wins, filts, noise_anchors, dropped) and prints a summary.
+    Targets that are excluded are removed from ``observed`` so the dataset builder
+    drops them (see build_dataset_real_picks).
+    """
+    filt_p = dict(fmin=args.p_fmin, fmax=args.p_fmax, order=args.order, tfade=args.p_tfade)
+    filt_s = dict(fmin=args.s_fmin, fmax=args.s_fmax, order=args.order, tfade=args.s_tfade)
+    win_p, win_s = (args.p_pre, args.p_post), (args.s_pre, args.s_post)
+    if abs((args.p_pre + args.p_post) - (args.s_pre + args.s_post)) > 1e-9:
+        raise SystemExit("P and S total window length (pre+post) must be equal "
+                         f"(P={args.p_pre + args.p_post}, S={args.s_pre + args.s_post})")
+
+    obs_anchors, wins, filts, noise_anchors, dropped = [], [], [], [], []
+    print(f"\n{'target':18s}{'phase':>6s}{'pick_s':>8s}{'score':>6s}  use")
+    for m in forward.meta:
+        net, sta, loc, cha = m["nslc"]
+        stc = (net, sta, loc)
+        ph = PHASE_OF[cha]
+        pr = picks_rel.get(stc, {})
+        p_off, s_off = pr.get("P"), pr.get("S")
+        off = p_off if ph == "P" else s_off
+        score = pr.get("p_score") if ph == "P" else pr.get("s_score")
+
+        excluded = (
+            off is None or p_off is None
+            or (args.min_score > 0 and score is not None and score < args.min_score)
+            or f"{net}.{sta}.{loc}.{cha}" in exclude_set
+            or f"{net}.{sta}" in exclude_set
+        )
+        obs_anchors.append(off if off is not None else (p_off if p_off is not None else 0.0))
+        wins.append(win_p if ph == "P" else win_s)
+        filts.append(filt_p if ph == "P" else filt_s)
+        noise_anchors.append(p_off if p_off is not None else 0.0)
+        if excluded:
+            dropped.append((net, sta, loc, cha))
+        sc = f"{score:.2f}" if score is not None else "  - "
+        os_ = f"{off:.2f}" if off is not None else "  - "
+        print(f"{net}.{sta}.{loc}.{cha:5s}{ph:>6s}{os_:>8s}{sc:>6s}  {'no ' if excluded else 'yes'}")
+    return obs_anchors, wins, filts, noise_anchors, dropped
+
+
+def model_anchors(forward):
+    """Per-target source-relative model traveltime (anyP for Z, anyS for N/E)."""
+    from pyrocko import orthodrome
+    out = []
+    for m in forward.meta:
+        st, cha = m["station"], m["nslc"][3]
+        dist = orthodrome.distance_accurate50m(forward.event.lat, forward.event.lon,
+                                               st.lat, st.lon)
+        phase_id = "anyP" if cha == "Z" else "anyS"
+        out.append(float(forward.store.t(phase_id, (forward.event.depth, dist))))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["real", "synthetic"], default="real")
+    # phase windows: observed cut at picks, synthetic at modeled arrivals.
+    # P and S total length (pre+post) must match so all targets share N.
+    ap.add_argument("--p-pre", type=float, default=0.1)
+    ap.add_argument("--p-post", type=float, default=0.3)
+    ap.add_argument("--s-pre", type=float, default=0.1)
+    ap.add_argument("--s-post", type=float, default=0.3)
+    ap.add_argument("--order", type=int, default=3, help="Butterworth filter order")
+    ap.add_argument("--p-fmin", type=float, default=2.0)
+    ap.add_argument("--p-fmax", type=float, default=20.0)
+    ap.add_argument("--p-tfade", type=float, default=0.1)
+    ap.add_argument("--s-fmin", type=float, default=1.0)
+    ap.add_argument("--s-fmax", type=float, default=15.0)
+    ap.add_argument("--s-tfade", type=float, default=0.1)
+    
+    ap.add_argument("--min-score", type=float, default=0.0,
+                    help="drop picks with confidence below this (0 keeps all)")
+    ap.add_argument("--exclude", default="",
+                    help="comma list of NET.STA or NET.STA.LOC.CHA to drop")
+    # noise / covariance
+    ap.add_argument("--noise-len", type=float, default=0.8)
+    ap.add_argument("--noise-gap", type=float, default=0.2)
+    ap.add_argument("--structure", choices=["variance", "exponential"], default="variance")
+    ap.add_argument("--group-by", choices=["global", "channel", "station", "trace"], default="station")
+    # source-type / magnitude priors
+    ap.add_argument("--dc", action="store_true", help="constrain to double couple")
+    ap.add_argument("--gamma-beta", default="3,3")
+    ap.add_argument("--delta-beta", default="3,3")
+    ap.add_argument("--mw-bounds", default="1.6,2.5")
+    ap.add_argument("--hp-bounds", default="-0.1,8.0")
+    ap.add_argument("--max-shift-sec", type=float, default=0.05,
+                    help="per-trace CC time-shift half-window in s (absorbs pick/model offset)")
+    ap.add_argument("--lag-penalty", type=float, default=0.0)
+    # sampler
+    ap.add_argument("--num-particles", type=int, default=600)
+    ap.add_argument("--mcmc-steps", type=int, default=10)
+    ap.add_argument("--kernel", choices=["rmh", "hmc"], default="rmh")
+    ap.add_argument("--waste-free", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--target-ess", type=float, default=0.85)
+    ap.add_argument("--snr", type=float, default=10.0, help="synthetic-mode SNR")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default="runs/eq02387_cmt_posterior.npz")
+    ap.add_argument("--outdir", default="report/eq02387_cmt")
+    args = ap.parse_args()
+
+    mw_bounds = tuple(float(x) for x in args.mw_bounds.split(","))
+    hp_bounds = tuple(float(x) for x in args.hp_bounds.split(","))
+    gamma_beta = tuple(float(x) for x in args.gamma_beta.split(","))
+    delta_beta = tuple(float(x) for x in args.delta_beta.split(","))
+    exclude_set = {s.strip() for s in args.exclude.split(",") if s.strip()}
+
+    event, stations, observed, picks_rel, _ = invio.load_invdata(PATHS["invdata"])
+    # FORK invdata S pick is a mispick (~6.4 s); the true S is at 1.25 s after origin
+    # (read off report/eq02387_picks_check.png).
+    if FORK in picks_rel:
+        picks_rel[FORK]["S"] = 1.25
+    print(f"event eq02387: lat={event.lat:.3f} lon={event.lon:.3f} depth={event.depth:.0f} m  "
+          f"Mw_cat~{event.magnitude}")
+
+    # rotate observed ENZ -> ZRT; station R/T channel orientations are set to match
+    # so the engine synthesises radial/transverse directly (P -> Z, S -> R & T).
+    stations, observed = invio.to_zrt(event, stations, observed)
+
+    forward = GFForward(PATHS["store_superdirs"], PATHS["store_id"], event, stations,
+                        channels=("Z", "R", "T"), quantity="velocity")
+    print(f"forward: {len(stations)} stations x Z,R,T -> {len(forward.targets)} targets "
+          f"(quantity=velocity, deltat={forward.deltat:.4f}s)")
+
+    obs_anchors, wins, filts, noise_anchors, dropped = build_window_specs(
+        forward, picks_rel, args, exclude_set)
+    for nslc in dropped:
+        observed.pop(nslc, None)
+    # CAP-style: observed cut at the picks, synthetic cut at the modeled arrival
+    # (where the synthetic energy is); the per-trace CC shift then aligns them.
+    basis_anchors = model_anchors(forward)
+    print("windows: observed on picks, synthetic on modeled arrivals (CAP-style)")
+
+    m6_ref = m6_from_sdr_mw(**GROND_DC_REF)
+    if args.mode == "synthetic":
+        dataset = ds.build_dataset_synthetic_picks(
+            forward, m6_ref, basis_anchors, wins, filts,
+            snr=args.snr, seed=args.seed, structure=args.structure, group_by=args.group_by)
+    else:
+        dataset = ds.build_dataset_real_picks(
+            forward, observed, event.time, basis_anchors, wins, filts, noise_anchors,
+            obs_anchors=obs_anchors, noise_len=args.noise_len, noise_gap=args.noise_gap,
+            structure=args.structure, group_by=args.group_by)
+    max_shift = int(round(args.max_shift_sec / forward.deltat))
+    print(f"dataset: T={dataset.basis.shape[0]} targets, N={dataset.basis.shape[2]} samples, "
+          f"G={dataset.n_groups} noise groups, autoshift=+/-{max_shift} samples "
+          f"({args.max_shift_sec:.2f}s)")
+
+    import jax
+    logprior_fn, loglik_fn = M.build_logdensities(
+        dataset, mw_bounds=mw_bounds, hp_bounds=hp_bounds, dc=args.dc,
+        max_shift=max_shift, lag_penalty_coef=args.lag_penalty,
+        gamma_beta=gamma_beta, delta_beta=delta_beta)
+    if not args.dc:
+        print(f"source-type prior: gamma~Beta{gamma_beta}, delta~Beta{delta_beta} (centred on DC)")
+    key = jax.random.PRNGKey(args.seed)
+    key, kinit = jax.random.split(key)
+    particles = M.init_particles(kinit, args.num_particles, dataset.n_groups, dc=args.dc,
+                                 gamma_beta=gamma_beta, delta_beta=delta_beta)
+
+    result = run_smc(logprior_fn, loglik_fn, particles, key,
+                     kernel=args.kernel, num_mcmc_steps=args.mcmc_steps,
+                     target_ess=args.target_ess, waste_free=args.waste_free)
+
+    posterior = M.extract_posterior(result["particles"], result["weights"],
+                                    mw_bounds, hp_bounds, dc=args.dc)
+    ref_label = "true" if args.mode == "synthetic" else "grond DC"
+    mean_m6, mw_est, kagan = report(m6_ref, ref_label, posterior, result["weights"])
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    np.savez(args.out, m6=posterior["m6"], weights=result["weights"],
+             mw=posterior["mw"], kappa=posterior["kappa"], h=posterior["h"],
+             sigma=posterior["sigma"], hp=posterior["hp"], m6_ref=m6_ref)
+    print(f"saved posterior -> {args.out}")
+
+    from src import plotting
+    os.makedirs(args.outdir, exist_ok=True)
+    bb = plotting.plot_fuzzy_beachball(
+        posterior["m6"], m6_ref,
+        os.path.join(args.outdir, f"{args.mode}_beachball.png"),
+        title=f"eq02387 {args.mode} ({len(posterior['m6'])} samples)")
+    wf = plotting.plot_waveform_fit(
+        dataset, mean_m6, forward.deltat, max_shift,
+        os.path.join(args.outdir, f"{args.mode}_waveform_fit.png"), mw=mw_est, kagan=kagan)
+    print(f"saved plots ->\n  {bb}\n  {wf}")
+
+
+if __name__ == "__main__":
+    main()

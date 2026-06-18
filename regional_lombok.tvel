@@ -1,0 +1,9 @@
+Regional 1-D model with mantle for gfz2018pmjk (2018 Lombok, Indonesia)
+Crust over mantle; targets observed regional moveout Pn~8.1 km/s, Sn~4.6 km/s. depth_km Vp_kms Vs_kms rho
+    0.000   5.80   3.30   2.60
+    5.000   6.10   3.52   2.72
+   12.000   6.60   3.78   2.85
+   19.900   6.95   3.95   2.95
+   20.000   8.10   4.55   3.30
+   60.000   8.20   4.60   3.35
+  120.000   8.30   4.65   3.40

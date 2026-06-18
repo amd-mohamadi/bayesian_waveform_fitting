@@ -149,7 +149,7 @@ To explicitly disable ratio enforcement in all cases:
 
 ## Ray-pattern polarity term (Pz/SH)
 
-`run_inversion.py` can add a CAPE-style polarity likelihood term based on ray-pattern radiation coefficients (from `src_smc_mti`) using `picks.dat`:
+`run_inversion.py` can add a CAPE-style polarity likelihood term based on ray-pattern radiation coefficients (from `src`) using `picks.dat`:
 
 - Internals: `read_data` + `polarity_matrix` + `polarity_ln_pdf`
 - This is independent from waveform-sign matching.
@@ -269,5 +269,9 @@ python run_inversion.py \
 
 It also prints:
 
-- `Waveform fit MSE`
-- `WAVEFORM_FIT_SCORE` (`-MSE`, higher is better)
+- `Waveform fit normalized L1` (`sum|syn-obs| / sum|obs|`; 1.0 means the
+  synthetic does not match the observed waveform)
+- `Waveform fit variance reduction` (`1 - sum(res^2)/sum(obs^2)`; 1.0 = perfect,
+  <=0 = no fit)
+- `Waveform fit MSE` (raw displacement units; not a fit score)
+- `WAVEFORM_FIT_SCORE` (variance reduction, higher is better)

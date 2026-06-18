@@ -2,7 +2,7 @@
 Simulated Inversion using Pre-trained Siamese Model + Adaptive SMC.
 
 LEGACY SCRIPT:
-- Active reusable forward-model utilities have been extracted to src_smc_mti.
+- Active reusable forward-model utilities have been extracted to src.
 - Keep this file only for the old standalone synthetic/Siamese workflow until
   that workflow is archived or removed.
 
@@ -41,7 +41,7 @@ except Exception:
     Axitra = None
     moment = None
 
-from src_smc_mti.tape import Tape_MT6, Tape_MT33, MT33_MT6
+from src.tape import Tape_MT6, Tape_MT33, MT33_MT6
 
 
 def _station_id_from_xml(xml_file: str, net_code: str, sta_code: str, cha) -> str:

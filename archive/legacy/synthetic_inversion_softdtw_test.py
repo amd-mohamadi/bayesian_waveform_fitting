@@ -3,7 +3,7 @@ Synthetic inversion test with noisy and shifted observations.
 
 LEGACY SCRIPT:
 - Active GSOT/Soft-DTW/posterior/beachball helpers have been extracted to
-  src_smc_mti package modules.
+  src package modules.
 - Keep this file only as an old synthetic demo/test workflow until it is moved
   to tests/examples or archived.
 
@@ -34,7 +34,7 @@ except Exception:
 
 
 sys.path.append(str(Path(__file__).parent))
-SMCMTI_SRC = Path(__file__).parent / "src_smc_mti"
+SMCMTI_SRC = Path(__file__).parent / "src"
 if SMCMTI_SRC.exists():
     sys.path.append(str(SMCMTI_SRC))
 
@@ -42,19 +42,19 @@ try:
     from src.plot.plot_classes import _AmplitudePlot
 except Exception:
     try:
-        from src_smc_mti.plot.plot_classes import _AmplitudePlot
+        from src.plot.plot_classes import _AmplitudePlot
     except Exception:
         _AmplitudePlot = None
 
-from src_smc_mti.forward import FastSynthesizer, calculate_arrival_time  # noqa: E402
-from src_smc_mti.io import (  # noqa: E402
+from src.forward import FastSynthesizer, calculate_arrival_time  # noqa: E402
+from src.io import (  # noqa: E402
     load_observation,
     load_stations_from_xml,
     load_velocity_model,
 )
-from src_smc_mti.moment_metrics import kagan_angle_deg  # noqa: E402
-from src_smc_mti.tape import MT33_MT6, Tape_MT33  # noqa: E402
-from src_smc_mti.waveform_likelihoods import L2Likelihood  # noqa: E402
+from src.moment_metrics import kagan_angle_deg  # noqa: E402
+from src.tape import MT33_MT6, Tape_MT33  # noqa: E402
+from src.waveform_likelihoods import L2Likelihood  # noqa: E402
 
 
 def add_noise_and_shifts(observation, snr_min=5.0, snr_max=10.0, max_shift=12):

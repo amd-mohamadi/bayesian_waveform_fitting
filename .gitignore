@@ -7,7 +7,17 @@ __pycache__/
 venv/
 env/
 .env
-
+old/
+beat*/
+eq02387*
+gf_stores/
+grond*
+report*
+runs/
+stations_grond_regional/
+CAPE*
+cape*
+docs/
 # Large local inputs and generated data
 MSEED/
 stationxml/
@@ -43,5 +53,11 @@ plot_waveforms.ipynb
 progress.md
 SCRIPT_INVENTORY.md
 task_plan.md
-*.md
+# *.md
 *.dat
+CAPEVelocityXYZ.csv
+cape_pathavg_eq02387_600m.tvel
+archive/legacy/waveform_likelihood_notes.md
+docs/AXITRA_SMC_EQ02387_DC_REFERENCE_RESULT.md
+docs/CLEANUP_MIGRATION_SUMMARY.md
+docs/GROND_REGIONAL_CMT_BENCHMARK.md
