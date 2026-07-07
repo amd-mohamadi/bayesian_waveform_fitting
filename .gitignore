@@ -18,6 +18,8 @@ stations_grond_regional/
 CAPE*
 cape*
 docs/
+SMTI/
+BJSI/
 # Large local inputs and generated data
 MSEED/
 stationxml/

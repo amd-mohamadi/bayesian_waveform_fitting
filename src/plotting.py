@@ -67,8 +67,90 @@ def plot_fuzzy_beachball(m6_samples, m6_true, outpath, n_show=500,
     return outpath
 
 
-def plot_waveform_fit(dataset, m6, deltat, max_shift, outpath, mw=None, kagan=None):
-    """Observed vs synthetic (posterior-mean MT) overlays, one panel per station-channel."""
+def plot_full_trace_windows(forward, observed, event_time, picks_rel, phase_of,
+                            obs_anchors, basis_anchors, wins, filts, m6, outpath,
+                            t_max=3.6, pid=None):
+    """Full-length obs vs synthetic (independently normalized) with the fit
+    windows shaded -- the guard against windows missing the synthetic energy.
+
+    Blue span = observed window (pick-anchored); orange span = synthetic window
+    (basis/model-anchored); green/magenta dotted = P/S picks.
+    """
+    from .processing import process_trace
+    trs = (forward.basis_pyrocko_traces(pid) if pid is not None
+           else forward.basis_pyrocko_traces())
+    tgrid = np.arange(0.0, t_max, forward.deltat)
+    stations = sorted({m["nslc"][1] for m in forward.meta})
+    chans = sorted({m["channel"] for m in forward.meta})
+    nr, nc = len(stations), len(chans)
+    fig, axes = plt.subplots(nr, nc, figsize=(4.6 * nc, 1.6 * nr),
+                             squeeze=False, sharex=True)
+    for jt, m in enumerate(forward.meta):
+        nslc = m["nslc"]
+        i, j = stations.index(nslc[1]), chans.index(m["channel"])
+        ax = axes[i][j]
+        filt = filts[jt]
+        syn = m6 @ np.stack([process_trace(trs[jt][k], tgrid, **filt) for k in range(6)])
+        tr = observed.get(nslc)
+        if tr is not None:
+            obs = process_trace(tr, event_time + tgrid, **filt)
+            ax.plot(tgrid, obs / (np.abs(obs).max() + 1e-30), "k", lw=0.6)
+        ax.plot(tgrid, syn / (np.abs(syn).max() + 1e-30), "r", lw=0.6)
+        t_pre, t_post = wins[jt]
+        ax.axvspan(obs_anchors[jt] - t_pre, obs_anchors[jt] + t_post,
+                   color="tab:blue", alpha=0.15)
+        ax.axvspan(basis_anchors[jt] - t_pre, basis_anchors[jt] + t_post,
+                   color="tab:orange", alpha=0.15)
+        pr = picks_rel.get(nslc[:3], {})
+        if pr.get("P") is not None:
+            ax.axvline(pr["P"], color="g", lw=0.8, ls=":")
+        if pr.get("S") is not None:
+            ax.axvline(pr["S"], color="m", lw=0.8, ls=":")
+        ax.set_yticks([]); ax.set_ylim(-1.2, 1.2)
+        ax.text(0.01, 0.85, f"{nslc[1]}.{m['channel']}", transform=ax.transAxes, fontsize=8)
+    for j, c in enumerate(chans):
+        axes[0][j].set_title(c, fontsize=10)
+        axes[-1][j].set_xlabel("source-relative time [s]", fontsize=8)
+    fig.suptitle("Full traces (indep. normalized): obs (black) vs synthetic (red); "
+                 "blue = observed window, orange = synthetic window, dotted = P/S picks",
+                 fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(outpath, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return outpath
+
+
+def plot_location_posterior(loc_xyz, weights, cat_xyz, map_xyz, outpath):
+    """Source-location posterior over the green cloud: marginal x/y/z histograms
+    + x-y scatter. Green = catalog hypocenter, red dashed/cross = MAP sample."""
+    fig, axes = plt.subplots(1, 4, figsize=(15, 3.4))
+    labels = ["x east [km]", "y north [km]", "z depth [km]"]
+    for q in range(3):
+        ax = axes[q]
+        ax.hist(loc_xyz[:, q], bins=30, weights=weights, color="tab:blue", alpha=0.75)
+        ax.axvline(cat_xyz[q], color="g", lw=1.2, label="catalog")
+        ax.axvline(map_xyz[q], color="r", lw=1.2, ls="--", label="MAP")
+        ax.set_xlabel(labels[q]); ax.set_yticks([])
+    axes[0].legend(fontsize=8)
+    ax = axes[3]
+    ax.scatter(loc_xyz[:, 0], loc_xyz[:, 1], s=6, c=weights, cmap="viridis", alpha=0.6)
+    ax.plot(cat_xyz[0], cat_xyz[1], "g*", ms=13, label="catalog")
+    ax.plot(map_xyz[0], map_xyz[1], "r+", ms=13, mew=2, label="MAP")
+    ax.set_xlabel(labels[0]); ax.set_ylabel(labels[1]); ax.set_aspect("equal")
+    ax.legend(fontsize=8)
+    fig.suptitle("Source-location posterior (discrete green-point grid)", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(outpath, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return outpath
+
+
+def plot_waveform_fit(dataset, m6, deltat, max_shift, outpath, mw=None, kagan=None,
+                      label="posterior mean"):
+    """Observed vs synthetic MT overlays, one panel per station-channel.
+
+    ``label`` names which MT is drawn (e.g. "posterior mean" or "MAP sample").
+    """
     synth = np.einsum("k,tkn->tn", m6, dataset.basis)
     obs = dataset.data
     meta = dataset.meta
@@ -96,7 +178,7 @@ def plot_waveform_fit(dataset, m6, deltat, max_shift, outpath, mw=None, kagan=No
         axes[0][j].set_title(c, fontsize=10)
         axes[-1][j].set_xlabel("time in window [s]", fontsize=8)
 
-    sup = "Waveform fit: observed (black) vs synthetic (red, posterior mean)"
+    sup = f"Waveform fit: observed (black) vs synthetic (red, {label})"
     if mw is not None:
         sup += f"   Mw={mw:.2f}"
     if kagan is not None:

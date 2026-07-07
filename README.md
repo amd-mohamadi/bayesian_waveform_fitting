@@ -141,6 +141,91 @@ Known limitations / next steps: invert depth (currently fixed at the catalog val
 per-station static weighting/QC for bad traces, optional `exponential` noise covariance,
 and validation on small-magnitude events (the design target; the test fixture is M5.9).
 
+## Small-event application: eq02387 (`run_eq02387_cmt.py`)
+
+Driver for the CAPE cluster event eq02387 (Mw ~2, DAS-derived location, 5 UU
+stations). Data come from `cape_events/eq02387/invdata.pkl` (ENZ velocity,
+rotated to ZRT); windows are **CAP-style**: the observed window is anchored on
+the phase pick (P → Z, S → R/T), the synthetic window on the model's own
+arrival, and a per-trace CC autoshift aligns them. An optional first-motion
+(Pz) **polarity probit term** (`--polarity-weight`) constrains the mechanism
+independently of the autoshift.
+
+### Green's functions: 1-D qseis or 3-D OpenSWPC reciprocity store
+
+By default synthetics come from the 1-D qseis store above. Passing
+**`--gf-npz <store.npz>`** switches to a 3-D OpenSWPC reciprocity (green-mode)
+store — for eq02387 an 8×8×8 cloud of green points at 150 m spacing (±525 m)
+around the hypocenter, dx = 30 m FDM on the FORGE/Cape 3-D velocity model,
+usable band ~2–12 Hz (see `../EQ02387_RECIPROCITY_STORE_PLAN.md` for the
+build + validation log):
+
+```
+../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz
+```
+
+The store has no traveltime table, so synthetic windows are anchored on
+**basis-detected onsets** (`basis_onset_anchors`: 6-component basis amplitude,
+searched within pick ± 0.35 s) — the 3-D model's S runs 40–185 ms ahead of the
+picks. Every real-mode run writes `real_full_traces.png` (fit windows shaded
+on the full traces) as a guard against window-selection errors.
+
+### Component selection and source-location sampling
+
+- **`--components Z`** (default `Z,R,T`): invert a subset of components, e.g.
+  P-wave only on the verticals. Polarity self-disables if Z is dropped.
+  `--exclude NET.STA[.LOC.CHA]` drops individual stations/traces.
+- **`--sample-location`** (requires `--gf-npz`): sample the source location
+  jointly with the MT over the green-point cloud — **discrete variant**: xyz
+  has a uniform prior over the cloud box and is snapped to the nearest of the
+  512 nodes inside the likelihood (windowed basis + polarity coefficients are
+  precomputed at every node). Location is constrained by waveform
+  shape/relative amplitudes, not arrival times (each node's window recentres
+  on its own onset and the autoshift absorbs the rest) — see
+  `../LOCATION_SAMPLING_PLAN.md`. Outputs add a location posterior
+  (`loc_xyz`, `map_pid` in the npz; `<mode>_location.png` plot); the waveform
+  fit / full-trace plots are drawn at the MAP node. Validation:
+  `--mode synthetic --synth-pid <n>` generates the synthetic data from green
+  point `n` — recovery lands within one grid cell.
+
+### Example runs
+
+```bash
+# 3-D store, all components, DC-constrained, joint location sampling
+conda run -n pymc python run_eq02387_cmt.py --mode real --dc --sample-location \
+  --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
+  --p-fmin 2 --p-fmax 20 --s-fmin 2 --s-fmax 12 --max-shift-sec 0.04 \
+  --num-particles 1000 --mcmc-steps 20 --polarity-weight 100 \
+  --out runs/eq02387_cmt_3d.npz --outdir report/eq02387_cmt_3d
+
+# P-wave-only (vertical components), fixed location
+conda run -n pymc python run_eq02387_cmt.py --mode real --components Z --dc \
+  --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
+  --p-fmin 2 --p-fmax 20 --max-shift-sec 0.04 \
+  --num-particles 1000 --mcmc-steps 20 --polarity-weight 100 \
+  --out runs/eq02387_cmt_3d_ponly.npz --outdir report/eq02387_cmt_3d_ponly
+
+# synthetic recovery incl. location (data generated from green point 300)
+conda run -n pymc python run_eq02387_cmt.py --mode synthetic --sample-location \
+  --synth-pid 300 --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
+  --p-fmin 2 --p-fmax 12 --s-fmin 2 --s-fmax 12 --max-shift-sec 0.04
+```
+
+### eq02387 results so far
+
+- The 1-D qseis path-average model was shown to dominate the misfit (S–P
+  residuals 10–30%, distance-proportional); the inversion machinery itself
+  recovers a synthetic mechanism to Kagan < 2°.
+- With the 3-D store (2–12 Hz, ±40 ms, polarity w=90): MAP Kagan **16°** vs
+  the grond DC reference (down from ~90–112° before the CAP-style synthetic
+  window fix), polarity 4/5, VR up to 0.91. Z-component fits and amplitudes
+  are excellent; FOR5/FORU horizontals remain under-predicted — consistent
+  with unmodelled shallow-Vs site amplification (the 3-D model clamps Vs at
+  1.5 km/s where the real basin fill is ~0.4 km/s). Planned next step:
+  per-station S-amplitude correction terms (fixed P factor, tight log-normal
+  prior on S) to decouple site gain from Mw without discarding P/S ratio
+  information.
+
 ## Design notes (open decisions)
 
 Recorded so they don't have to be re-litigated each session:

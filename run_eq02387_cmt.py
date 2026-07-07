@@ -141,18 +141,18 @@ def main():
     ap.add_argument("--mode", choices=["real", "synthetic"], default="real")
     # phase windows: observed cut at picks, synthetic at modeled arrivals.
     # P and S total length (pre+post) must match so all targets share N.
-    ap.add_argument("--p-pre", type=float, default=0.1)
-    ap.add_argument("--p-post", type=float, default=0.3)
-    ap.add_argument("--s-pre", type=float, default=0.1)
-    ap.add_argument("--s-post", type=float, default=0.3)
+    ap.add_argument("--p-pre", type=float, default=0.125)
+    ap.add_argument("--p-post", type=float, default=0.275)
+    ap.add_argument("--s-pre", type=float, default=0.125)
+    ap.add_argument("--s-post", type=float, default=0.275)
     ap.add_argument("--order", type=int, default=3, help="Butterworth filter order")
     ap.add_argument("--p-fmin", type=float, default=2.0)
-    ap.add_argument("--p-fmax", type=float, default=20.0)
+    ap.add_argument("--p-fmax", type=float, default=30.0)
     ap.add_argument("--p-tfade", type=float, default=0.1)
     ap.add_argument("--s-fmin", type=float, default=1.0)
-    ap.add_argument("--s-fmax", type=float, default=15.0)
+    ap.add_argument("--s-fmax", type=float, default=20.0)
     ap.add_argument("--s-tfade", type=float, default=0.1)
-    
+
     ap.add_argument("--min-score", type=float, default=0.0,
                     help="drop picks with confidence below this (0 keeps all)")
     ap.add_argument("--exclude", default="",
@@ -164,9 +164,9 @@ def main():
     ap.add_argument("--group-by", choices=["global", "channel", "station", "trace"], default="station")
     # source-type / magnitude priors
     ap.add_argument("--dc", action="store_true", help="constrain to double couple")
-    ap.add_argument("--gamma-beta", default="3,3")
-    ap.add_argument("--delta-beta", default="3,3")
-    ap.add_argument("--mw-bounds", default="1.6,2.5")
+    ap.add_argument("--gamma-beta", default="2,2")
+    ap.add_argument("--delta-beta", default="2,2")
+    ap.add_argument("--mw-bounds", default="1.5,3.0")
     ap.add_argument("--hp-bounds", default="-0.1,8.0")
     ap.add_argument("--max-shift-sec", type=float, default=0.05,
                     help="per-trace CC time-shift half-window in s (absorbs pick/model offset)")
@@ -179,11 +179,23 @@ def main():
     # sampler
     ap.add_argument("--num-particles", type=int, default=600)
     ap.add_argument("--mcmc-steps", type=int, default=10)
-    ap.add_argument("--kernel", choices=["rmh", "hmc"], default="rmh")
+    ap.add_argument("--kernel", choices=["rmh", "hmc", "mwg"], default="mwg")
+    ap.add_argument("--mwg-mechanism-steps", type=int, default=None,
+                    help="inner RMH moves for the (kappa,h,sigma) block when --kernel mwg")
     ap.add_argument("--waste-free", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--target-ess", type=float, default=0.85)
     ap.add_argument("--snr", type=float, default=10.0, help="synthetic-mode SNR")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--gf-npz", default=None,
+                    help="OpenSWPC reciprocity GF store npz; replaces the qseis store")
+    ap.add_argument("--components", default="Z,R,T",
+                    help="comma list of components to invert, e.g. Z or Z,T")
+    ap.add_argument("--sample-location", action="store_true",
+                    help="sample the source location over the green-point cloud "
+                         "(discrete nearest-node; requires --gf-npz)")
+    ap.add_argument("--synth-pid", type=int, default=None,
+                    help="synthetic mode: generate the data from this green point "
+                         "instead of the nearest one (location-recovery test)")
     ap.add_argument("--out", default="runs/eq02387_cmt_posterior.npz")
     ap.add_argument("--outdir", default="report/eq02387_cmt")
     args = ap.parse_args()
@@ -193,6 +205,9 @@ def main():
     gamma_beta = tuple(float(x) for x in args.gamma_beta.split(","))
     delta_beta = tuple(float(x) for x in args.delta_beta.split(","))
     exclude_set = {s.strip() for s in args.exclude.split(",") if s.strip()}
+    components = tuple(s.strip().upper() for s in args.components.split(",") if s.strip())
+    if not components or any(c not in ("Z", "R", "T") for c in components):
+        raise SystemExit(f"--components must be a subset of Z,R,T (got {args.components!r})")
 
     event, stations, observed, picks_rel, raw = invio.load_invdata(PATHS["invdata"])
     # FORK invdata S pick is a mispick (~6.4 s); the true S is at 1.25 s after origin
@@ -206,29 +221,64 @@ def main():
     # so the engine synthesises radial/transverse directly (P -> Z, S -> R & T).
     stations, observed = invio.to_zrt(event, stations, observed)
 
-    forward = GFForward(PATHS["store_superdirs"], PATHS["store_id"], event, stations,
-                        channels=("Z", "R", "T"), quantity="velocity")
-    print(f"forward: {len(stations)} stations x Z,R,T -> {len(forward.targets)} targets "
-          f"(quantity=velocity, deltat={forward.deltat:.4f}s)")
+    if (args.sample_location or args.synth_pid is not None) and not args.gf_npz:
+        raise SystemExit("--sample-location / --synth-pid require --gf-npz")
+
+    if args.gf_npz:
+        from src.forward import NpzGFForward
+        src_d = raw["source"]
+        source_xyz_km = (src_d["x"] / 1e3, src_d["y"] / 1e3, src_d["z"] / 1e3)
+        forward = NpzGFForward(args.gf_npz, event, stations, source_xyz_km,
+                               channels=components,
+                               all_points=args.sample_location or args.synth_pid is not None)
+        print(f"forward: 3D GF store {args.gf_npz} (point offset "
+              f"{forward.point_offset_m:.0f} m, deltat={forward.deltat:.4f}s)")
+    else:
+        forward = GFForward(PATHS["store_superdirs"], PATHS["store_id"], event, stations,
+                            channels=components, quantity="velocity")
+        print(f"forward: {len(stations)} stations x {','.join(components)} -> "
+              f"{len(forward.targets)} targets "
+              f"(quantity=velocity, deltat={forward.deltat:.4f}s)")
 
     obs_anchors, wins, filts, noise_anchors, dropped = build_window_specs(
         forward, picks_rel, args, exclude_set)
     for nslc in dropped:
         observed.pop(nslc, None)
-    # CAP-style: observed cut at the picks, synthetic cut at the modeled arrival
-    # (where the synthetic energy is); the per-trace CC shift then aligns them.
-    basis_anchors = model_anchors(forward)
-    print("windows: observed on picks, synthetic on modeled arrivals (CAP-style)")
+    if args.gf_npz:
+        # CAP-style, like the 1D path: observed windows on picks, synthetic
+        # windows on the synthetic's own arrivals -- detected from the basis
+        # energy since the 3D store has no traveltime table. (The 3D model's
+        # S runs ~100-150 ms earlier than the picks even though P matches, so
+        # pick-anchored synthetic windows clip the synthetic S.)
+        from src.forward import basis_onset_anchors
+        basis_anchors = basis_onset_anchors(forward, obs_anchors)
+        print("windows: observed on picks, synthetic on basis-detected onsets (CAP-style)")
+        print(f"{'target':18s}{'phase':>6s}{'pick_s':>8s}{'onset_s':>9s}{'diff_ms':>9s}")
+        for m, oa, ba in zip(forward.meta, obs_anchors, basis_anchors):
+            net, sta, loc, cha = m["nslc"]
+            print(f"{net}.{sta}.{loc}.{cha:5s}{PHASE_OF[cha]:>6s}{oa:8.2f}{ba:9.2f}"
+                  f"{(ba - oa) * 1e3:9.0f}")
+    else:
+        # CAP-style: observed cut at the picks, synthetic cut at the modeled arrival
+        # (where the synthetic energy is); the per-trace CC shift then aligns them.
+        basis_anchors = model_anchors(forward)
+        print("windows: observed on picks, synthetic on modeled arrivals (CAP-style)")
 
     # First-motion (Pz) polarity term (real mode only; synthetic recovery uses the
     # waveform alone). Observed polarity comes from the picker CSV; the synthetic
     # first-motion coefficient is read off the raw GF basis at the modeled onset.
-    polarity = None
+    polarity, pol_by_station, tP_by = None, None, None
     if args.mode == "real" and args.polarity_weight > 0:
         pol_by_station = invio.load_pz_polarity(
             raw.get("event_id", "eq02387"), raw["station_ids"],
             PATHS["picks_file"], PATHS["polarity_cache"])
-        polarity = ds.build_polarity_coeffs(forward, pol_by_station)
+        # 3D store has no traveltime table: read the first motion just before the
+        # P pick (pick lags the true onset by up to ~70 ms)
+        tP_by = ({stc: pr["P"] - 0.05 for stc, pr in picks_rel.items()
+                  if pr.get("P") is not None} if args.gf_npz else None)
+        polarity = ds.build_polarity_coeffs(
+            forward, pol_by_station,
+            n_fm_sec=0.12 if args.gf_npz else 0.05, tP_by_station=tP_by)
         if polarity is None:
             print("polarity: no observed Pz polarities found -> term disabled")
         else:
@@ -242,14 +292,42 @@ def main():
 
     m6_ref = m6_from_sdr_mw(**GROND_DC_REF)
     if args.mode == "synthetic":
+        synth_anchors, synth_pid = basis_anchors, None
+        if args.synth_pid is not None:
+            # location-recovery test: data generated from a non-nearest green point
+            from src.forward import basis_onset_anchors
+            synth_pid = args.synth_pid
+            synth_anchors = basis_onset_anchors(forward, obs_anchors, pid=synth_pid)
+            print(f"synthetic data from green point {synth_pid} at "
+                  f"{forward.points_xyz_km[synth_pid]} km "
+                  f"(nearest to catalog is {forward.pid})")
         dataset = ds.build_dataset_synthetic_picks(
-            forward, m6_ref, basis_anchors, wins, filts,
-            snr=args.snr, seed=args.seed, structure=args.structure, group_by=args.group_by)
+            forward, m6_ref, synth_anchors, wins, filts,
+            snr=args.snr, seed=args.seed, structure=args.structure, group_by=args.group_by,
+            pid=synth_pid)
     else:
         dataset = ds.build_dataset_real_picks(
             forward, observed, event.time, basis_anchors, wins, filts, noise_anchors,
             obs_anchors=obs_anchors, noise_len=args.noise_len, noise_gap=args.noise_gap,
             structure=args.structure, group_by=args.group_by)
+
+    location = None
+    if args.sample_location:
+        keep_nslc = {m["nslc"] for m in dataset.meta}
+        print(f"\nlocation sampling: windowing the basis at {forward.n_points} "
+              "green points ...")
+        basis_all, a_pol_all = ds.build_location_stack(
+            forward, obs_anchors, wins, filts, keep_nslc,
+            pol_by_station=pol_by_station if polarity is not None else None,
+            n_fm_sec=0.12, tP_by_station=tP_by)
+        axes, pid_lut = forward.grid()
+        lo = np.array([a[0] for a in axes])
+        hi = np.array([a[-1] for a in axes])
+        location = dict(basis_all=basis_all, a_pol_all=a_pol_all, axes=axes,
+                        pid_lut=pid_lut, lo=lo, hi=hi)
+        print(f"location: {pid_lut.shape} node grid, "
+              f"x[{lo[0]:.3f},{hi[0]:.3f}] y[{lo[1]:.3f},{hi[1]:.3f}] "
+              f"z[{lo[2]:.3f},{hi[2]:.3f}] km (uniform prior, nearest-node snap)")
     max_shift = int(round(args.max_shift_sec / forward.deltat))
     print(f"dataset: T={dataset.basis.shape[0]} targets, N={dataset.basis.shape[2]} samples, "
           f"G={dataset.n_groups} noise groups, autoshift=+/-{max_shift} samples "
@@ -259,22 +337,63 @@ def main():
     logprior_fn, loglik_fn = M.build_logdensities(
         dataset, mw_bounds=mw_bounds, hp_bounds=hp_bounds, dc=args.dc,
         max_shift=max_shift, lag_penalty_coef=args.lag_penalty,
-        gamma_beta=gamma_beta, delta_beta=delta_beta, polarity=polarity)
+        gamma_beta=gamma_beta, delta_beta=delta_beta, polarity=polarity,
+        location=location)
     if not args.dc:
         print(f"source-type prior: gamma~Beta{gamma_beta}, delta~Beta{delta_beta} (centred on DC)")
     key = jax.random.PRNGKey(args.seed)
     key, kinit = jax.random.split(key)
     particles = M.init_particles(kinit, args.num_particles, dataset.n_groups, dc=args.dc,
-                                 gamma_beta=gamma_beta, delta_beta=delta_beta)
+                                 gamma_beta=gamma_beta, delta_beta=delta_beta,
+                                 sample_location=args.sample_location)
 
     result = run_smc(logprior_fn, loglik_fn, particles, key,
                      kernel=args.kernel, num_mcmc_steps=args.mcmc_steps,
+                     mwg_mechanism_steps=args.mwg_mechanism_steps,
                      target_ess=args.target_ess, waste_free=args.waste_free)
 
-    posterior = M.extract_posterior(result["particles"], result["weights"],
-                                    mw_bounds, hp_bounds, dc=args.dc)
+    posterior = M.extract_posterior(
+        result["particles"], result["weights"], mw_bounds, hp_bounds, dc=args.dc,
+        loc_bounds=(location["lo"], location["hi"]) if location is not None else None)
     ref_label = "true" if args.mode == "synthetic" else "grond DC"
     mean_m6, mw_est, kagan = report(m6_ref, ref_label, posterior, result["weights"])
+
+    # Representative (MAP) sample: the highest-posterior particle. The posterior-mean
+    # 6-vector is not a valid mechanism when the posterior is broad, so the waveform
+    # fit is drawn from the MAP sample (recovers per-trace fits the mean smears out).
+    logdens = np.asarray(jax.vmap(
+        lambda p: logprior_fn(p) + loglik_fn(p))(result["particles"]))
+    idx_map = int(np.argmax(logdens))
+    map_m6 = posterior["m6"][idx_map]
+    map_mt = m6_to_mt(map_m6)
+    s1m, d1m, r1m = map_mt.both_strike_dip_rake()[0]
+    mw_map = float(posterior["mw"][idx_map])
+    kagan_map = float(pmt.kagan_angle(m6_to_mt(m6_ref), map_mt)) if m6_ref is not None else None
+    print(f"MAP sample strike={s1m:6.1f}  dip={d1m:5.1f}  rake={r1m:6.1f}  Mw={mw_map:.2f}"
+          + (f"   Kagan={kagan_map:.1f} deg" if kagan_map is not None else ""))
+
+    map_pid = None
+    if location is not None:
+        loc = posterior["loc_xyz"]                       # (n, 3) km
+        w = result["weights"]
+        mean_xyz = np.average(loc, axis=0, weights=w)
+        std_xyz = np.sqrt(np.average((loc - mean_xyz) ** 2, axis=0, weights=w))
+        map_xyz = loc[idx_map]
+        ijk = tuple(int(np.argmin(np.abs(a - map_xyz[q])))
+                    for q, a in enumerate(location["axes"]))
+        map_pid = int(location["pid_lut"][ijk])
+        map_node = forward.points_xyz_km[map_pid]
+        ref_xyz = (forward.points_xyz_km[args.synth_pid]
+                   if args.mode == "synthetic" and args.synth_pid is not None
+                   else np.asarray(source_xyz_km))
+        ref_lab = "true point" if args.mode == "synthetic" else "catalog"
+        print(f"location mean xyz = ({mean_xyz[0]:.3f}, {mean_xyz[1]:.3f}, "
+              f"{mean_xyz[2]:.3f}) km  +/- ({std_xyz[0]*1e3:.0f}, {std_xyz[1]*1e3:.0f}, "
+              f"{std_xyz[2]*1e3:.0f}) m")
+        print(f"location MAP node {map_pid} at ({map_node[0]:.3f}, {map_node[1]:.3f}, "
+              f"{map_node[2]:.3f}) km; offset from {ref_lab} = "
+              f"({(map_node[0]-ref_xyz[0])*1e3:+.0f}, {(map_node[1]-ref_xyz[1])*1e3:+.0f}, "
+              f"{(map_node[2]-ref_xyz[2])*1e3:+.0f}) m")
 
     if polarity is not None:
         m6n = mean_m6 / (np.linalg.norm(mean_m6) + 1e-30)
@@ -287,21 +406,45 @@ def main():
                   f"{'yes' if x > 0 else 'NO'}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    extra = ({"loc_xyz": posterior["loc_xyz"], "map_pid": map_pid}
+             if location is not None else {})
     np.savez(args.out, m6=posterior["m6"], weights=result["weights"],
              mw=posterior["mw"], kappa=posterior["kappa"], h=posterior["h"],
-             sigma=posterior["sigma"], hp=posterior["hp"], m6_ref=m6_ref)
+             sigma=posterior["sigma"], hp=posterior["hp"], m6_ref=m6_ref,
+             map_m6=map_m6, idx_map=idx_map, **extra)
     print(f"saved posterior -> {args.out}")
 
     from src import plotting
     os.makedirs(args.outdir, exist_ok=True)
+    lc = None
+    if location is not None:
+        # draw the waveform fit / window plots at the MAP location, not the
+        # catalog-nearest node the dataset was initially built on
+        dataset.basis = location["basis_all"][map_pid]
+        from src.forward import basis_onset_anchors
+        basis_anchors = basis_onset_anchors(forward, obs_anchors, pid=map_pid)
+        ref_xyz = (forward.points_xyz_km[args.synth_pid]
+                   if args.mode == "synthetic" and args.synth_pid is not None
+                   else np.asarray(source_xyz_km))
+        lc = plotting.plot_location_posterior(
+            posterior["loc_xyz"], result["weights"], ref_xyz,
+            posterior["loc_xyz"][idx_map],
+            os.path.join(args.outdir, f"{args.mode}_location.png"))
     bb = plotting.plot_fuzzy_beachball(
         posterior["m6"], m6_ref,
         os.path.join(args.outdir, f"{args.mode}_beachball.png"),
         title=f"eq02387 {args.mode} ({len(posterior['m6'])} samples)")
     wf = plotting.plot_waveform_fit(
-        dataset, mean_m6, forward.deltat, max_shift,
-        os.path.join(args.outdir, f"{args.mode}_waveform_fit.png"), mw=mw_est, kagan=kagan)
-    print(f"saved plots ->\n  {bb}\n  {wf}")
+        dataset, map_m6, forward.deltat, max_shift,
+        os.path.join(args.outdir, f"{args.mode}_waveform_fit.png"), mw=mw_map,
+        kagan=kagan_map, label="MAP sample")
+    ft = None
+    if args.mode == "real":
+        ft = plotting.plot_full_trace_windows(
+            forward, observed, event.time, picks_rel, PHASE_OF,
+            obs_anchors, basis_anchors, wins, filts, map_m6,
+            os.path.join(args.outdir, "real_full_traces.png"), pid=map_pid)
+    print("saved plots ->\n  " + "\n  ".join(p for p in (bb, wf, ft, lc) if p))
 
 
 if __name__ == "__main__":

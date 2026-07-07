@@ -112,14 +112,16 @@ def build_dataset_real(forward, observed, event_time, t_pre, t_post, filt,
 # (t_pre + t_post) MUST be equal across targets so all share N and vectorize.
 
 
-def _process_basis_picks(forward, anchors, wins, filts):
+def _process_basis_picks(forward, anchors, wins, filts, pid=None):
     """Per target: processed basis (6, N) windowed at a per-target source-relative anchor.
 
     anchors : (T,) source-relative window-anchor time per target (pick - origin)
     wins    : list of (t_pre, t_post) per target
     filts   : list of filt dicts per target
+    pid     : optional green-point index (NpzGFForward multi-point mode)
     """
-    basis_traces = forward.basis_pyrocko_traces()
+    basis_traces = (forward.basis_pyrocko_traces(pid) if pid is not None
+                    else forward.basis_pyrocko_traces())
     deltat = forward.deltat
     grids, B_list = [], []
     for jt, trs6 in enumerate(basis_traces):
@@ -136,9 +138,10 @@ def _process_basis_picks(forward, anchors, wins, filts):
 
 
 def build_dataset_synthetic_picks(forward, m6_true, anchors, wins, filts,
-                                  snr=5.0, seed=0, structure="variance", group_by="trace"):
+                                  snr=5.0, seed=0, structure="variance", group_by="trace",
+                                  pid=None):
     """Synthetic recovery test on pick-anchored windows (observed = synth + noise)."""
-    B_list, grids, deltat = _process_basis_picks(forward, anchors, wins, filts)
+    B_list, grids, deltat = _process_basis_picks(forward, anchors, wins, filts, pid=pid)
     rng = np.random.default_rng(seed)
     data, noise_list = [], []
     for B in B_list:
@@ -197,7 +200,8 @@ def build_dataset_real_picks(forward, observed, event_time, anchors, wins, filts
     return WaveformDataset(basis, np.stack(data), weights, logdet, hp_index, n_groups, meta)
 
 
-def build_polarity_coeffs(forward, pol_by_station, channel="Z", n_fm_sec=0.05):
+def build_polarity_coeffs(forward, pol_by_station, channel="Z", n_fm_sec=0.05,
+                          tP_by_station=None, pid=None):
     """First-motion (Pz) polarity coefficients for the probit likelihood (Route B).
 
     For each ``channel`` target whose station has an observed polarity, take the
@@ -213,7 +217,7 @@ def build_polarity_coeffs(forward, pol_by_station, channel="Z", n_fm_sec=0.05):
     meta=[{station, nslc, polarity}]) or None if no station has a polarity.
     """
     from pyrocko import orthodrome
-    raw = forward.raw_basis()
+    raw = forward.raw_basis(pid) if pid is not None else forward.raw_basis()
     deltat = forward.deltat
     n_fm = max(1, int(round(n_fm_sec / deltat)))
     a_list, inc_list, meta = [], [], []
@@ -224,9 +228,12 @@ def build_polarity_coeffs(forward, pol_by_station, channel="Z", n_fm_sec=0.05):
         if pol is None or pol == 0.0:
             continue
         st = m["station"]
-        dist = orthodrome.distance_accurate50m(forward.event.lat, forward.event.lon,
-                                               st.lat, st.lon)
-        tP = float(forward.store.t("anyP", (forward.event.depth, dist)))
+        if tP_by_station is not None:
+            tP = float(tP_by_station[m["nslc"][:3]])
+        else:
+            dist = orthodrome.distance_accurate50m(forward.event.lat, forward.event.lon,
+                                                   st.lat, st.lon)
+            tP = float(forward.store.t("anyP", (forward.event.depth, dist)))
         B, tmin = raw[jt]["basis"], raw[jt]["tmin"]
         k0 = int(round((tP - tmin) / deltat))
         seg = B[:, k0:k0 + n_fm]
@@ -239,3 +246,34 @@ def build_polarity_coeffs(forward, pol_by_station, channel="Z", n_fm_sec=0.05):
     if not a_list:
         return None
     return {"a_pol": np.array(a_list), "inc": np.array(inc_list), "meta": meta}
+
+
+def build_location_stack(forward, guess_anchors, wins, filts, keep_nslc,
+                         pol_by_station=None, n_fm_sec=0.12, tP_by_station=None):
+    """Windowed MT basis (and polarity coeffs) at EVERY green point of an
+    NpzGFForward, for discrete source-location sampling.
+
+    Each point's basis is windowed at its OWN onset anchors (CAP-style, same as
+    the single-point path), so every candidate location presents an
+    arrival-centred synthetic; location is then constrained by waveform
+    shape/relative amplitudes, not arrival times (see LOCATION_SAMPLING_PLAN.md).
+
+    keep_nslc filters/orders targets to match the dataset (targets whose
+    observed trace was dropped are skipped, in forward.meta order).
+
+    Returns (basis_all (P, T_kept, 6, N), a_pol_all (P, Npol, 6) or None).
+    """
+    from .forward import basis_onset_anchors
+    keep = [jt for jt, m in enumerate(forward.meta) if m["nslc"] in keep_nslc]
+    basis_all, apol_all = [], []
+    for pid in range(forward.n_points):
+        anchors = basis_onset_anchors(forward, guess_anchors, pid=pid)
+        B_list, _, _ = _process_basis_picks(forward, anchors, wins, filts, pid=pid)
+        basis_all.append(np.stack([B_list[jt] for jt in keep]))
+        if pol_by_station is not None:
+            pol = build_polarity_coeffs(forward, pol_by_station, n_fm_sec=n_fm_sec,
+                                        tP_by_station=tP_by_station, pid=pid)
+            apol_all.append(pol["a_pol"])
+        if (pid + 1) % 64 == 0:
+            print(f"  location stack: {pid + 1}/{forward.n_points} points")
+    return np.stack(basis_all), (np.stack(apol_all) if apol_all else None)

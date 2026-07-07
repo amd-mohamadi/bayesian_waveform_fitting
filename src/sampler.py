@@ -43,6 +43,9 @@ from blackjax.smc.resampling import systematic
 from blackjax.smc import inner_kernel_tuning
 import blackjax.mcmc.random_walk as blackjax_rw
 
+from .mwg_kernel import (build_mwg_kernel, build_blocks_from_keys,
+                         default_inner_steps, block_scale_overrides)
+
 
 def _unwrap(state):
     return state.sampler_state if hasattr(state, "sampler_state") else state
@@ -64,6 +67,7 @@ def run_smc(
     adapt_proposal=True,
     proposal_factor=None,
     num_mcmc_steps=10,
+    mwg_mechanism_steps=None,
     proposal_scale=0.1,
     nuts_step_size=1e-2,
     nuts_max_doublings=10,
@@ -185,6 +189,43 @@ def run_smc(
 
             mcmc_parameters = blackjax.smc.extend_params(
                 {"proposal_scale": jnp.asarray(proposal_scale, dtype=jnp.float64)})
+
+    elif kernel == "mwg":
+        # Metropolis-within-Gibbs: cycle parameter blocks, each with its own
+        # additive-RMH proposal + inner-step count. Slots into the same
+        # inner_kernel_tuning / waste-free path as the joint RMH below; only the
+        # step fn and the per-block scale-update fn differ.
+        tuned = True
+        mcmc_init_fn = blackjax.rmh.init
+        field_names = list(initial_particles.keys())
+        blocks = build_blocks_from_keys(field_names)
+        inner_steps = default_inner_steps(blocks, mechanism_steps=mwg_mechanism_steps)
+        mcmc_step_fn = build_mwg_kernel(blocks, inner_steps)
+
+        initial_stds = {n: jnp.std(initial_particles[n]) for n in field_names}
+
+        def block_scales(particles, block_acc=None):
+            cur = {n: jnp.std(particles[n]) for n in field_names}
+            sc = block_scale_overrides(blocks, initial_stds, cur,
+                                       block_acceptance_rate=block_acc)
+            return blackjax.smc.extend_params(sc)
+
+        def mcmc_parameter_update_fn(key, state, info):
+            # Increment 2: drive each block's proposal toward its target acceptance.
+            # block_acceptance_rates has the block axis LAST and an unknown number of
+            # leading axes (waste-free stacks scan x particles), so reduce everything
+            # but the last axis to a per-block scalar. Falls back to pure std-tracking
+            # if the field doesn't survive the SMC info wrapping.
+            upd = getattr(info, "update_info", info)
+            arr = getattr(upd, "block_acceptance_rates", None)
+            block_acc = None
+            if arr is not None:
+                arr = jnp.asarray(arr)
+                m = jnp.mean(arr.reshape(-1, arr.shape[-1]), axis=0)  # (n_blocks,)
+                block_acc = {b.name: m[i] for i, b in enumerate(blocks)}
+            return block_scales(state.particles, block_acc)
+
+        init_param = block_scales(initial_particles)
     else:
         raise ValueError(f"unknown kernel: {kernel}")
 
