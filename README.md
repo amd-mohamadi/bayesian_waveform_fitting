@@ -187,6 +187,14 @@ on the full traces) as a guard against window-selection errors.
   fit / full-trace plots are drawn at the MAP node. Validation:
   `--mode synthetic --synth-pid <n>` generates the synthetic data from green
   point `n` — recovery lands within one grid cell.
+- **`--loc-radius-m R`**: limit the location prior box to catalog ± R m per
+  axis. Important in practice: with the whole ±525 m cloud open, the
+  (amplitude-only) location freedom runs to the cloud edge absorbing model
+  error; bounded to the catalog's real uncertainty (±150 m for the DAS
+  locations) it stays at the catalog node and *sharpens* the mechanism.
+- Waveform plots are drawn at **true amplitude** (no normalization): observed
+  and synthetic share each panel's scale in both `*_waveform_fit.png` and
+  `*_full_traces.png`, so amplitude over/under-prediction is directly visible.
 
 ### Example runs
 
@@ -213,18 +221,39 @@ conda run -n pymc python run_eq02387_cmt.py --mode synthetic --sample-location \
 
 ### eq02387 results so far
 
-- The 1-D qseis path-average model was shown to dominate the misfit (S–P
-  residuals 10–30%, distance-proportional); the inversion machinery itself
-  recovers a synthetic mechanism to Kagan < 2°.
-- With the 3-D store (2–12 Hz, ±40 ms, polarity w=90): MAP Kagan **16°** vs
-  the grond DC reference (down from ~90–112° before the CAP-style synthetic
-  window fix), polarity 4/5, VR up to 0.91. Z-component fits and amplitudes
-  are excellent; FOR5/FORU horizontals remain under-predicted — consistent
-  with unmodelled shallow-Vs site amplification (the 3-D model clamps Vs at
-  1.5 km/s where the real basin fill is ~0.4 km/s). Planned next step:
-  per-station S-amplitude correction terms (fixed P factor, tight log-normal
-  prior on S) to decouple site gain from Mw without discarding P/S ratio
-  information.
+**Best run** — 3-D store, Z (P-wave) components only, location sampled within
+catalog ±150 m, ±50 ms shift, polarity w=100, DC
+(`report/eq02387_cmt_3d_loc150`):
+
+- strike/dip/rake = **79.5 / 83.4 / −25.0**, Kagan **4.5°** vs the grond DC
+  mechanism (77.8 / 87.7 / −24.1) — same mechanism from fully independent
+  Green's functions and method. Polarity 4/5 (FORU is the one holdout).
+- **Mw 2.54** vs the catalog local magnitude **Ml 2.64** (FebMarch_catalog,
+  manual). The grond Mw 1.92 turned out to be the outlier (1-D amplitude
+  physics), not the reference — the 3-D store's absolute amplitude
+  calibration is good to ~0.1 mag units (Ml/Mw scale caveat at M2).
+- Location posterior sits at the catalog node (MAP one 75 m snap away,
+  ±45 m std) — a consistency check, not a relocation.
+
+What the run matrix taught (all Z-only unless noted):
+
+- **1-D qseis GFs, same data/settings**: Kagan 46.5°, autoshifts railed,
+  FSB3.Z unfittable — the velocity model error goes straight into the
+  mechanism when only 5 P waveforms constrain it.
+- **Adding R/T (3-D)**: Kagan degrades to ~21° (dip pulled 16°). The
+  well-fitting horizontals are precise-but-biased (unmodelled shallow-Vs site
+  amplification: model clamps Vs at 1.5 km/s over ~0.4 km/s basin fill);
+  per-trace noise hyperparameters do NOT fix this (they mute misfitting
+  traces, not biased-but-fitting ones). Fix would be per-station S-amplitude
+  terms (fixed P factor, tight log-normal S prior) — not yet implemented.
+- **Long (2.5 s) Z windows**: Kagan ~89°, VR ≤ 0.14 — the observed coda
+  (basin scattering) dominates the window and the smooth 3-D model cannot
+  produce it; short pick-anchored windows are the physically right choice at
+  these frequencies.
+- **hp (hierarchical noise scaling) frozen at 0**: Kagan 13.7°, Mw 2.75,
+  overconfident posterior — hp is the likelihood's only accommodation of
+  model error and is essential; without it the quietest station's bias
+  dominates.
 
 ## Design notes (open decisions)
 

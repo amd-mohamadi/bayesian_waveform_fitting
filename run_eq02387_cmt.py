@@ -193,6 +193,9 @@ def main():
     ap.add_argument("--sample-location", action="store_true",
                     help="sample the source location over the green-point cloud "
                          "(discrete nearest-node; requires --gf-npz)")
+    ap.add_argument("--loc-radius-m", type=float, default=None,
+                    help="limit the location prior box to catalog +/- this many "
+                         "meters per axis (default: the whole cloud)")
     ap.add_argument("--synth-pid", type=int, default=None,
                     help="synthetic mode: generate the data from this green point "
                          "instead of the nearest one (location-recovery test)")
@@ -323,6 +326,10 @@ def main():
         axes, pid_lut = forward.grid()
         lo = np.array([a[0] for a in axes])
         hi = np.array([a[-1] for a in axes])
+        if args.loc_radius_m is not None:
+            r_km = args.loc_radius_m / 1e3
+            cat = np.asarray(source_xyz_km)
+            lo, hi = np.maximum(lo, cat - r_km), np.minimum(hi, cat + r_km)
         location = dict(basis_all=basis_all, a_pol_all=a_pol_all, axes=axes,
                         pid_lut=pid_lut, lo=lo, hi=hi)
         print(f"location: {pid_lut.shape} node grid, "

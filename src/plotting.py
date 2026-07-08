@@ -70,8 +70,8 @@ def plot_fuzzy_beachball(m6_samples, m6_true, outpath, n_show=500,
 def plot_full_trace_windows(forward, observed, event_time, picks_rel, phase_of,
                             obs_anchors, basis_anchors, wins, filts, m6, outpath,
                             t_max=3.6, pid=None):
-    """Full-length obs vs synthetic (independently normalized) with the fit
-    windows shaded -- the guard against windows missing the synthetic energy.
+    """Full-length obs vs synthetic (true amplitude, shared panel scale) with the
+    fit windows shaded -- the guard against windows missing the synthetic energy.
 
     Blue span = observed window (pick-anchored); orange span = synthetic window
     (basis/model-anchored); green/magenta dotted = P/S picks.
@@ -94,8 +94,8 @@ def plot_full_trace_windows(forward, observed, event_time, picks_rel, phase_of,
         tr = observed.get(nslc)
         if tr is not None:
             obs = process_trace(tr, event_time + tgrid, **filt)
-            ax.plot(tgrid, obs / (np.abs(obs).max() + 1e-30), "k", lw=0.6)
-        ax.plot(tgrid, syn / (np.abs(syn).max() + 1e-30), "r", lw=0.6)
+            ax.plot(tgrid, obs, "k", lw=0.6)
+        ax.plot(tgrid, syn, "r", lw=0.6)
         t_pre, t_post = wins[jt]
         ax.axvspan(obs_anchors[jt] - t_pre, obs_anchors[jt] + t_post,
                    color="tab:blue", alpha=0.15)
@@ -106,12 +106,12 @@ def plot_full_trace_windows(forward, observed, event_time, picks_rel, phase_of,
             ax.axvline(pr["P"], color="g", lw=0.8, ls=":")
         if pr.get("S") is not None:
             ax.axvline(pr["S"], color="m", lw=0.8, ls=":")
-        ax.set_yticks([]); ax.set_ylim(-1.2, 1.2)
+        ax.set_yticks([])
         ax.text(0.01, 0.85, f"{nslc[1]}.{m['channel']}", transform=ax.transAxes, fontsize=8)
     for j, c in enumerate(chans):
         axes[0][j].set_title(c, fontsize=10)
         axes[-1][j].set_xlabel("source-relative time [s]", fontsize=8)
-    fig.suptitle("Full traces (indep. normalized): obs (black) vs synthetic (red); "
+    fig.suptitle("Full traces (true amplitude): obs (black) vs synthetic (red); "
                  "blue = observed window, orange = synthetic window, dotted = P/S picks",
                  fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
@@ -168,10 +168,9 @@ def plot_waveform_fit(dataset, m6, deltat, max_shift, outpath, mw=None, kagan=No
         o, s = obs[jt], synth[jt]
         lag, s_al = best_shift(o, s, max_shift)
         vr = 1.0 - np.sum((o - s_al) ** 2) / (np.sum(o ** 2) + 1e-30)
-        amp = np.max(np.abs(o)) or 1.0
-        ax.plot(t, o / amp, "k", lw=0.7)
-        ax.plot(t, s_al / amp, "r", lw=0.7)
-        ax.set_yticks([]); ax.set_ylim(-1.3, 1.3)
+        ax.plot(t, o, "k", lw=0.7)
+        ax.plot(t, s_al, "r", lw=0.7)
+        ax.set_yticks([])
         ax.text(0.02, 0.86, f"{m['nslc'][1]}.{m['channel']}  VR={vr:.2f}  dt={lag*deltat*1e3:+.0f}ms",
                 transform=ax.transAxes, fontsize=7, va="top")
     for j, c in enumerate(chans):
