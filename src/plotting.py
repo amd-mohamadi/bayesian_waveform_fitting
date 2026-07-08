@@ -122,23 +122,27 @@ def plot_full_trace_windows(forward, observed, event_time, picks_rel, phase_of,
 
 def plot_location_posterior(loc_xyz, weights, cat_xyz, map_xyz, outpath):
     """Source-location posterior over the green cloud: marginal x/y/z histograms
-    + x-y scatter. Green = catalog hypocenter, red dashed/cross = MAP sample."""
+    + x-y scatter, all as offsets from the catalog hypocenter in meters (catalog
+    at 0 by construction). Red dashed/cross = MAP sample."""
+    off = (loc_xyz - cat_xyz) * 1e3       # (n, 3) m
+    map_off = (map_xyz - cat_xyz) * 1e3
     fig, axes = plt.subplots(1, 4, figsize=(15, 3.4))
-    labels = ["x east [km]", "y north [km]", "z depth [km]"]
+    labels = ["x east offset [m]", "y north offset [m]", "z depth offset [m]"]
     for q in range(3):
         ax = axes[q]
-        ax.hist(loc_xyz[:, q], bins=30, weights=weights, color="tab:blue", alpha=0.75)
-        ax.axvline(cat_xyz[q], color="g", lw=1.2, label="catalog")
-        ax.axvline(map_xyz[q], color="r", lw=1.2, ls="--", label="MAP")
+        ax.hist(off[:, q], bins=30, weights=weights, color="tab:blue", alpha=0.75)
+        ax.axvline(0.0, color="g", lw=1.2, label="catalog")
+        ax.axvline(map_off[q], color="r", lw=1.2, ls="--", label="MAP")
         ax.set_xlabel(labels[q]); ax.set_yticks([])
     axes[0].legend(fontsize=8)
     ax = axes[3]
-    ax.scatter(loc_xyz[:, 0], loc_xyz[:, 1], s=6, c=weights, cmap="viridis", alpha=0.6)
-    ax.plot(cat_xyz[0], cat_xyz[1], "g*", ms=13, label="catalog")
-    ax.plot(map_xyz[0], map_xyz[1], "r+", ms=13, mew=2, label="MAP")
+    ax.scatter(off[:, 0], off[:, 1], s=6, c=weights, cmap="viridis", alpha=0.6)
+    ax.plot(0.0, 0.0, "g*", ms=13, label="catalog")
+    ax.plot(map_off[0], map_off[1], "r+", ms=13, mew=2, label="MAP")
     ax.set_xlabel(labels[0]); ax.set_ylabel(labels[1]); ax.set_aspect("equal")
     ax.legend(fontsize=8)
-    fig.suptitle("Source-location posterior (discrete green-point grid)", fontsize=11)
+    fig.suptitle("Source-location posterior, offset from catalog hypocenter "
+                 "(discrete green-point grid)", fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(outpath, dpi=140, bbox_inches="tight")
     plt.close(fig)
