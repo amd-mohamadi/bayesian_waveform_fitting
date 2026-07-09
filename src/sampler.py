@@ -206,7 +206,13 @@ def run_smc(
 
         def block_scales(particles, block_acc=None):
             cur = {n: jnp.std(particles[n]) for n in field_names}
-            sc = block_scale_overrides(blocks, initial_stds, cur,
+            # min_ratio floors the proposal scale at a fraction of the PRIOR
+            # width; the eq02387 waveform posterior is ~60x narrower than the
+            # prior, so the default 0.1 floor pinned acceptance at ~0.03
+            # (proposals 16x too big to ever be accepted). 0.005 keeps the
+            # anti-collapse guard while letting std-tracking reach the true
+            # posterior scale.
+            sc = block_scale_overrides(blocks, initial_stds, cur, min_ratio=0.005,
                                        block_acceptance_rate=block_acc)
             return blackjax.smc.extend_params(sc)
 

@@ -30,7 +30,8 @@ def best_shift(obs, syn, max_shift):
 
 
 def plot_fuzzy_beachball(m6_samples, m6_true, outpath, n_show=500,
-                         beachball_type="full", title="Posterior moment tensor"):
+                         beachball_type="full", title="Posterior moment tensor",
+                         ref_label="true"):
     """Fuzzy beachball from the posterior ensemble; mean (black) and true (blue) overlaid."""
     idx = np.linspace(0, len(m6_samples) - 1, min(n_show, len(m6_samples))).astype(int)
     mts = [m6_to_mt(m6_samples[i]) for i in idx]
@@ -54,7 +55,8 @@ def plot_fuzzy_beachball(m6_samples, m6_true, outpath, n_show=500,
             position=(0.0, 0.0), size=2.0, size_units="data",
             color_t="blue", color_p="white", edgecolor="black", linewidth=1.5)
         kagan = pmt.kagan_angle(m6_to_mt(m6_true), mean_mt)
-        ax2.set_title(f"true mechanism\nKagan(mean, true) = {kagan:.1f}deg", fontsize=10)
+        ax2.set_title(f"{ref_label} mechanism\nKagan(mean, {ref_label}) = {kagan:.1f}deg",
+                      fontsize=10)
     else:
         beachball.plot_beachball_mpl(
             mean_mt, ax2, beachball_type=beachball_type, position=(0.0, 0.0),

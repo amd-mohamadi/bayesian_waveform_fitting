@@ -32,6 +32,7 @@ cape_events/*/openswpc_lhm*/
 o20/
 picks_amp.csv
 *.npz
+!reference_solutions/*.npz
 *.h5
 *.hdf5
 *.mseed

@@ -44,6 +44,8 @@ PATHS = {
     "invdata": os.path.join(HERE, "cape_events", "eq02387", "invdata.pkl"),
     "picks_file": os.path.join(HERE, "picks_amp.csv"),
     "polarity_cache": os.path.join(HERE, "cape_events", "eq02387", "pz_polarity.csv"),
+    "smti_reference_mt6": os.path.join(
+        HERE, "reference_solutions", "eq02387_smti_blackjax_ppol_ampratio_mt6.npz"),
 }
 # grond DC reference solution (grond_eq02387_dc_reference_run.md) for comparison
 GROND_DC_REF = dict(strike=77.76, dip=87.65, rake=-24.06, mw=1.915)
@@ -362,7 +364,20 @@ def main():
     posterior = M.extract_posterior(
         result["particles"], result["weights"], mw_bounds, hp_bounds, dc=args.dc,
         loc_bounds=(location["lo"], location["hi"]) if location is not None else None)
+
+    # Reference mechanism: synthetic recovery compares against the generating
+    # (grond DC) tensor; real runs compare against the SMTI BlackJAX
+    # polarity/amplitude-ratio solution (independent data types; the grond 1-D
+    # waveform solution inherits too much velocity-model error to referee).
     ref_label = "true" if args.mode == "synthetic" else "grond DC"
+    if args.mode == "real" and os.path.exists(PATHS["smti_reference_mt6"]):
+        from src import smti_style_plots as ssp
+        _ref = np.load(PATHS["smti_reference_mt6"])
+        u = ssp.from_smti_mt6(np.median(_ref["mt6"], axis=1))
+        # scale the unit tensor to the catalog Ml so the reference row shows a
+        # meaningful magnitude (|m6| = sqrt(2) M0 for our NED 6-vector)
+        m6_ref = np.sqrt(2.0) * pmt.magnitude_to_moment(2.64) * u / np.linalg.norm(u)
+        ref_label = "SMTI ref"
     mean_m6, mw_est, kagan = report(m6_ref, ref_label, posterior, result["weights"])
 
     # Representative (MAP) sample: the highest-posterior particle. The posterior-mean
@@ -412,6 +427,11 @@ def main():
             print(f"  {pm['station']:10s}{pm['polarity']:+8.2f}{x:+9.3f}  "
                   f"{'yes' if x > 0 else 'NO'}")
 
+    if args.mode == "real":
+        m6_grond = m6_from_sdr_mw(**GROND_DC_REF)
+        print(f"secondary comparison, grond DC (1-D waveform): Kagan = "
+              f"{pmt.kagan_angle(m6_to_mt(m6_grond), m6_to_mt(mean_m6)):.1f} deg")
+
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     extra = ({"loc_xyz": posterior["loc_xyz"], "map_pid": map_pid}
              if location is not None else {})
@@ -440,18 +460,45 @@ def main():
     bb = plotting.plot_fuzzy_beachball(
         posterior["m6"], m6_ref,
         os.path.join(args.outdir, f"{args.mode}_beachball.png"),
-        title=f"eq02387 {args.mode} ({len(posterior['m6'])} samples)")
+        title=f"eq02387 {args.mode} ({len(posterior['m6'])} samples)",
+        ref_label=ref_label)
     wf = plotting.plot_waveform_fit(
         dataset, map_m6, forward.deltat, max_shift,
         os.path.join(args.outdir, f"{args.mode}_waveform_fit.png"), mw=mw_map,
         kagan=kagan_map, label="MAP sample")
     ft = None
+    smti_paths = []
     if args.mode == "real":
         ft = plotting.plot_full_trace_windows(
             forward, observed, event.time, picks_rel, PHASE_OF,
             obs_anchors, basis_anchors, wins, filts, map_m6,
             os.path.join(args.outdir, "real_full_traces.png"), pid=map_pid)
-    print("saved plots ->\n  " + "\n  ".join(p for p in (bb, wf, ft, lc) if p))
+
+        # SMTI-style figures: station-annotated beachballs (median + GMM mode),
+        # Kaverina/Hudson HDI diagrams, arviz-style parameter posteriors.
+        from src import smti_style_plots as ssp
+        from pyrocko import gf as pyrocko_gf
+        if pol_by_station is None:
+            pol_by_station = invio.load_pz_polarity(
+                raw.get("event_id", "eq02387"), raw["station_ids"],
+                PATHS["picks_file"], PATHS["polarity_cache"])
+        qseis_store = pyrocko_gf.LocalEngine(
+            store_superdirs=PATHS["store_superdirs"]).get_store(PATHS["store_id"])
+        station_geom = ssp.station_takeoff_azimuth(event, stations, qseis_store)
+
+        bb_mm = ssp.plot_median_and_mode_beachballs(
+            posterior["m6"], station_geom, pol_by_station, args.outdir, prefix=args.mode)
+        print(f"posterior median vs mode Kagan: "
+              f"{pmt.kagan_angle(m6_to_mt(bb_mm['median_m6']), m6_to_mt(bb_mm['mode_m6'])):.1f} deg")
+        smti_paths += [bb_mm["median_path"], bb_mm["mode_path"]]
+
+        kh = ssp.plot_kaverina_hudson(posterior["m6"], args.outdir, prefix=args.mode)
+        smti_paths += [kh["kaverina_path"], kh["hudson_path"]]
+
+        av = ssp.plot_arviz_posteriors(posterior, args.outdir, prefix=args.mode, dc=args.dc)
+        smti_paths += [p for k, p in av.items() if k.endswith("_path")]
+
+    print("saved plots ->\n  " + "\n  ".join(p for p in (bb, wf, ft, lc, *smti_paths) if p))
 
 
 if __name__ == "__main__":
