@@ -205,11 +205,55 @@ def plot_kaverina_hudson(posterior_m6, outdir, prefix="real", hdi_prob=0.90,
     return {"kaverina_path": kav_path, "hudson_path": hud_path}
 
 
+def _canonical_sdr(m6_samples):
+    """Per-sample (strike, dip, rake) with a CONSISTENT plane choice.
+
+    A moment tensor has two (or, for near-vertical planes, symmetric)
+    strike/dip/rake descriptions; raw Tape-parameter marginals mix them
+    (label switching), producing spurious twin lobes and meaningless means.
+    Pick, per sample, the plane whose strike is circularly closest to the
+    ensemble-median first-plane strike.
+    """
+    from pyrocko import moment_tensor as pmt
+
+    def both(m6):
+        return pmt.MomentTensor(mnn=m6[0], mee=m6[1], mdd=m6[2],
+                                mne=m6[3], mnd=m6[4], med=m6[5]).both_strike_dip_rake()
+
+    # Anchor on the posterior-mean mechanism's first plane. Per sample,
+    # consider FOUR representations -- each of the two nodal planes plus its
+    # flipped-normal twin (s+180, 180-d, -r) -- and keep the one closest to
+    # the anchor. The flipped twin may have dip > 90: that is intentional, so
+    # a near-vertical plane whose dip posterior straddles 90 stays one smooth
+    # family instead of strike-flipping at the dip=90 convention boundary.
+    def variants(p):
+        s, d_, r = p
+        return [(s, d_, r), ((s + 180.0) % 360.0, 180.0 - d_, -r)]
+
+    s_ref, d_ref, _ = both(np.mean(m6_samples, axis=0))[0]
+
+    def dist(p):
+        ds = abs((p[0] - s_ref + 180.0) % 360.0 - 180.0)
+        return ds + abs(p[1] - d_ref)
+
+    out = np.empty((len(m6_samples), 3))
+    for i, m6 in enumerate(m6_samples):
+        p1, p2 = both(m6)
+        cands = variants(p1) + variants(p2)
+        out[i] = min(cands, key=dist)
+    return out
+
+
 def plot_arviz_posteriors(posterior, outdir, prefix="real", dc=False, hdi_prob=0.90):
     """arviz-style marginal posterior plots for the Tape mechanism parameters
     (kappa, h, sigma) and, if not --dc, the source-type lune coordinates
     (gamma, delta) -- SMTI's posterior_dc.png / posterior_non_dc.png analogs.
     ``posterior`` is the dict returned by ``model.extract_posterior``.
+
+    Also writes ``<prefix>_posterior_sdr.png``: strike/dip/rake marginals with
+    a canonical per-sample plane choice (see ``_canonical_sdr``), immune to
+    the conjugate-representation label switching that makes raw kappa/sigma
+    marginals bimodal for near-vertical planes.
     """
     import arviz as az
     import matplotlib
@@ -235,6 +279,19 @@ def plot_arviz_posteriors(posterior, outdir, prefix="real", dc=False, hdi_prob=0
         plt.gcf().savefig(p, dpi=150, bbox_inches="tight")
         plt.close("all")
         out["non_dc_path"] = p
+
+    if "m6" in posterior:
+        sdr = _canonical_sdr(np.asarray(posterior["m6"], dtype=float))
+        idata_sdr = az.from_dict(posterior={
+            "strike": sdr[:, 0].reshape(1, -1),
+            "dip": sdr[:, 1].reshape(1, -1),
+            "rake": sdr[:, 2].reshape(1, -1)})
+        az.plot_posterior(idata_sdr, var_names=["strike", "dip", "rake"],
+                          hdi_prob=hdi_prob)
+        p = os.path.join(outdir, f"{prefix}_posterior_sdr.png")
+        plt.gcf().savefig(p, dpi=150, bbox_inches="tight")
+        plt.close("all")
+        out["sdr_path"] = p
 
     summary_df = az.summary(idata, var_names=all_vars, hdi_prob=hdi_prob)
     summary_path = os.path.join(outdir, f"{prefix}_arviz_summary.csv")

@@ -44,7 +44,7 @@ from blackjax.smc import inner_kernel_tuning
 import blackjax.mcmc.random_walk as blackjax_rw
 
 from .mwg_kernel import (build_mwg_kernel, build_blocks_from_keys,
-                         default_inner_steps, block_scale_overrides)
+                         default_inner_steps, block_proposal_params)
 
 
 def _unwrap(state):
@@ -205,14 +205,11 @@ def run_smc(
         initial_stds = {n: jnp.std(initial_particles[n]) for n in field_names}
 
         def block_scales(particles, block_acc=None):
-            cur = {n: jnp.std(particles[n]) for n in field_names}
-            # min_ratio floors the proposal scale at a fraction of the PRIOR
-            # width; the eq02387 waveform posterior is ~60x narrower than the
-            # prior, so the default 0.1 floor pinned acceptance at ~0.03
-            # (proposals 16x too big to ever be accepted). 0.005 keeps the
-            # anti-collapse guard while letting std-tracking reach the true
-            # posterior scale.
-            sc = block_scale_overrides(blocks, initial_stds, cur, min_ratio=0.005,
+            # Covariance-aligned proposals per block (scalar for 1-d blocks).
+            # min_ratio=0.005: the eq02387 waveform posterior is ~60x narrower
+            # than the prior; the old 0.1 floor pinned acceptance at ~0.03.
+            sc = block_proposal_params(blocks, initial_stds, particles,
+                                       min_ratio=0.005,
                                        block_acceptance_rate=block_acc)
             return blackjax.smc.extend_params(sc)
 

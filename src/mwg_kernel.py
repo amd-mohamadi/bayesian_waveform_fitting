@@ -41,14 +41,32 @@ class MWGInfo(NamedTuple):
 
 
 def _build_block_proposal(block: RMHBlock, scale):
-    """Additive proposal that perturbs only ``block``'s fields (scalar scale)."""
+    """Additive proposal that perturbs only ``block``'s fields.
+
+    ``scale`` is either a scalar std (isotropic step per field) or a (d, d)
+    Cholesky factor over the block's flattened fields (correlated step aligned
+    with the population covariance -- essential when the tempered posterior is
+    a thin correlated ridge, where an isotropic ball constantly falls off it).
+    """
 
     def random_step(rng_key, position):
-        keys = random.split(rng_key, len(block.fields))
         move = {name: jnp.zeros_like(val) for name, val in position.items()}
-        for key, field in zip(keys, block.fields):
-            move[field] = scale * random.normal(
-                key, shape=position[field].shape, dtype=position[field].dtype)
+        scale_arr = jnp.asarray(scale)
+        if scale_arr.ndim == 2:
+            d = scale_arr.shape[0]
+            z = random.normal(rng_key, shape=(d,),
+                              dtype=position[block.fields[0]].dtype)
+            step = scale_arr @ z
+            offset = 0
+            for field in block.fields:
+                n = position[field].size
+                move[field] = step[offset:offset + n].reshape(position[field].shape)
+                offset += n
+        else:
+            keys = random.split(rng_key, len(block.fields))
+            for key, field in zip(keys, block.fields):
+                move[field] = scale_arr * random.normal(
+                    key, shape=position[field].shape, dtype=position[field].dtype)
         return move
 
     return random_step
@@ -128,6 +146,44 @@ def default_inner_steps(blocks, mechanism_steps=None):
     if mechanism_steps is not None:
         steps["mechanism"] = int(mechanism_steps)
     return {b.name: steps.get(b.name, 1) for b in blocks}
+
+
+def block_proposal_params(blocks, initial_stds, particles, min_ratio=0.005,
+                          block_acceptance_rate=None, adaptation_rate=1.5,
+                          accept_mult_bounds=(0.5, 4.0)):
+    """Per-block proposal parameters from the particle population.
+
+    1-d blocks get the scalar std-tracking rule (as ``block_scale_overrides``);
+    multi-d blocks get ``(2.38/sqrt(d)) * chol(cov + jitter*I)`` -- a
+    covariance-aligned random walk (Haario-style), so proposals move along the
+    posterior's correlated ridges instead of stepping off them isotropically.
+    The diagonal jitter ``(min_ratio * initial_std)^2`` keeps every direction
+    proposable (anti-collapse floor). The acceptance-driven multiplier is the
+    same as in ``block_scale_overrides``.
+    """
+    lo, hi = accept_mult_bounds
+    out = {}
+    for b in blocks:
+        cols = [particles[f].reshape(particles[f].shape[0], -1) for f in b.fields]
+        X = jnp.concatenate(cols, axis=1)                    # (n, d)
+        d = X.shape[1]
+        optimal = 2.38 / jnp.sqrt(jnp.asarray(d, dtype=jnp.float64))
+        ini = jnp.mean(jnp.asarray([initial_stds[f] for f in b.fields]))
+        mult = jnp.asarray(1.0)
+        if block_acceptance_rate is not None and b.name in block_acceptance_rate:
+            target = DEFAULT_BLOCK_TARGET_ACCEPTANCE.get(b.name, 0.30)
+            mult = jnp.clip(
+                jnp.exp(adaptation_rate * (block_acceptance_rate[b.name] - target)),
+                lo, hi)
+        if d == 1:
+            cur = jnp.std(X[:, 0])
+            out[b.name] = jnp.maximum(optimal * cur, min_ratio * optimal * ini) * mult
+        else:
+            C = jnp.cov(X, rowvar=False)
+            jitter = (min_ratio * ini) ** 2
+            L = jnp.linalg.cholesky(C + jitter * jnp.eye(d))
+            out[b.name] = optimal * mult * L
+    return out
 
 
 def block_scale_overrides(blocks, initial_stds, current_stds, min_ratio=0.1,
