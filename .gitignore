@@ -64,3 +64,7 @@ archive/legacy/waveform_likelihood_notes.md
 docs/AXITRA_SMC_EQ02387_DC_REFERENCE_RESULT.md
 docs/CLEANUP_MIGRATION_SUMMARY.md
 docs/GROND_REGIONAL_CMT_BENCHMARK.md
+
+# The examples folder is tracked (reference input/output for new cases)
+!examples/
+!examples/**

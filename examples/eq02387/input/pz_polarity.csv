@@ -1,0 +1,6 @@
+station_id,polarity,phase_type,score
+UU.FOR2.01.HH,0.86,Pz,0.945
+UU.FOR5.01.HH,-0.9,Pz,0.914
+UU.FORK.01.GH,0.89,Pz,0.953
+UU.FORU.01.HH,1.0,Pz,0.316
+UU.FSB3.01.HH,-0.86,Pz,0.75
