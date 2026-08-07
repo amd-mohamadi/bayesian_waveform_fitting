@@ -255,6 +255,43 @@ What the run matrix taught (all Z-only unless noted):
   model error and is essential; without it the quietest station's bias
   dominates.
 
+**Polarity-weight sweep** (Z-only, full MT, location ±250 m, corrected FORU
+polarity): the mechanism is **flat for w ∈ [0, 25]** (~79.6 / 82.8 / −27,
+5/5 polarities) — the P amplitudes alone (w=0) already determine it, and the
+polarity term merely confirms. At **w=100** the probit term stops acting as a
+sign constraint and starts maximizing polarity *margins*, pushing stations
+away from nodal planes and distorting the mechanism (→ 84 / 79 / −2).
+**Recommended: `--polarity-weight 5`** for Z-only runs — enough to veto
+sign-flipped modes, too weak to distort.
+
+**ZRT recipe — closing the half-cycle cheat** (`--lag-penalty`): with R/T
+components and a free ±50 ms autoshift, the oscillatory S waves let a
+polarity-flipped mechanism fit almost as well by sliding every window half a
+cycle (shifts railed at −24…−50 ms, 0/5 polarities) — and that cheat mode was
+the global optimum. Two knobs close it: **`--lag-penalty 2.0`** (quadratic
+per-sample cost on each trace's autoshift lag, making a railed shift
+prohibitively expensive) and **`--polarity-weight 50`** (hard veto on flipped
+Z first motions). Reference ZRT run
+(`report/eq02387_cmt_3d_loc250_fullmt_zrt_lp`):
+
+```bash
+conda run -n pymc python run_eq02387_cmt.py \
+  --mode real --components Z,R,T --sample-location --loc-radius-m 250 \
+  --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
+  --p-fmin 2 --p-fmax 20 --s-fmin 2 --s-fmax 12 \
+  --max-shift-sec 0.05 --lag-penalty 2.0 \
+  --num-particles 2000 --mcmc-steps 20 --polarity-weight 50 \
+  --out runs/eq02387_cmt_3d_loc250_fullmt_zrt_lp.npz \
+  --outdir report/eq02387_cmt_3d_loc250_fullmt_zrt_lp
+```
+
+Result: strike/dip/rake **258.5 / 84.8 / +17.6**, **Kagan 5.0°** vs the SMTI
+BlackJAX polarity + amplitude-ratio reference solution, 5/5 polarities,
+Mw 2.47 — the full three-component waveform inversion independently
+reproduces the polarity/amplitude-ratio mechanism. Remaining wart: 31% CLVD
++ 19% ISO absorb the unmodelled shallow-Vs site amplification on the
+horizontals (per-station S-amplitude terms would clean this up).
+
 ## Design notes (open decisions)
 
 Recorded so they don't have to be re-litigated each session:
