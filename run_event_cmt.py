@@ -22,8 +22,8 @@ The invdata FORK S pick is a mispick (~6.4 s); it is overridden to 1.25 s after 
 origin -- the actual S arrival read off report/eq02387_picks_check.png.
 
 Run from the repo root:
-    conda run -n pymc python run_eq02387_cmt.py --mode real
-    conda run -n pymc python run_eq02387_cmt.py --mode synthetic   # recovery test
+    conda run -n pymc python run_event_cmt.py --mode real
+    conda run -n pymc python run_event_cmt.py --mode synthetic   # recovery test
 """
 import argparse
 import os

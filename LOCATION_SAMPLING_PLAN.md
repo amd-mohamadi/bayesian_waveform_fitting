@@ -1,7 +1,7 @@
 # Plan: joint location + MT sampling over the 512-point green cloud
 
 > **Status: Variant A (discrete) implemented** — `--sample-location` in
-> `run_eq02387_cmt.py` (+ `--synth-pid` for location-recovery tests).
+> `run_event_cmt.py` (+ `--synth-pid` for location-recovery tests).
 > Validated: synthetic recovery from an off-centre point lands within one
 > grid cell (MAP node +0/−150/+0 m, mean ±40 m, Kagan 6.8° at smoke-test
 > sampler settings); 1-D path and single-point 3-D path regressions
@@ -75,7 +75,7 @@ autoshift `data_shifts`) is location-independent and unchanged.
    (Verify the block actually appears; add `"loc"` to the mechanism-blocks
    list only if mixing demands it.)
 
-7. **Driver (`run_eq02387_cmt.py`).** New flag `--sample-location
+7. **Driver (`run_event_cmt.py`).** New flag `--sample-location
    {off,discrete,interp}` (default `off` = exactly today's behavior).
    When on: build the stack (steps 2, 5), pass it to `build_logdensities`
    and `init_particles`, and extend the report/outputs:

@@ -1,13 +1,13 @@
 """Diagnostic: for a saved posterior, compare per-trace waveform VR of the
 posterior-MEAN tensor (what the plot draws) vs the single best-fitting sample.
 
-Rebuilds the real-data dataset exactly as run_eq02387_cmt.main() does, then scores
+Rebuilds the real-data dataset exactly as run_event_cmt.main() does, then scores
 each m6 sample by total autoshift L2 misfit and reports FORK.Z / FORU.Z VRs.
 """
 import argparse, os
 import numpy as np
 
-import run_eq02387_cmt as R
+import run_event_cmt as R
 from src import invdata as invio
 from src.forward import GFForward
 from src import dataset as ds

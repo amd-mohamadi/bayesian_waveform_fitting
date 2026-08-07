@@ -141,7 +141,7 @@ Known limitations / next steps: invert depth (currently fixed at the catalog val
 per-station static weighting/QC for bad traces, optional `exponential` noise covariance,
 and validation on small-magnitude events (the design target; the test fixture is M5.9).
 
-## Small-event application: eq02387 (`run_eq02387_cmt.py`)
+## Small-event application: eq02387 (`run_event_cmt.py`)
 
 Driver for the CAPE cluster event eq02387 (Mw ~2, DAS-derived location, 5 UU
 stations). Data come from `cape_events/eq02387/invdata.pkl` (ENZ velocity,
@@ -200,21 +200,21 @@ on the full traces) as a guard against window-selection errors.
 
 ```bash
 # 3-D store, all components, DC-constrained, joint location sampling
-conda run -n pymc python run_eq02387_cmt.py --mode real --dc --sample-location \
+conda run -n pymc python run_event_cmt.py --mode real --dc --sample-location \
   --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
   --p-fmin 2 --p-fmax 20 --s-fmin 2 --s-fmax 12 --max-shift-sec 0.04 \
   --num-particles 1000 --mcmc-steps 20 --polarity-weight 100 \
   --out runs/eq02387_cmt_3d.npz --outdir report/eq02387_cmt_3d
 
 # P-wave-only (vertical components), fixed location
-conda run -n pymc python run_eq02387_cmt.py --mode real --components Z --dc \
+conda run -n pymc python run_event_cmt.py --mode real --components Z --dc \
   --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
   --p-fmin 2 --p-fmax 20 --max-shift-sec 0.04 \
   --num-particles 1000 --mcmc-steps 20 --polarity-weight 100 \
   --out runs/eq02387_cmt_3d_ponly.npz --outdir report/eq02387_cmt_3d_ponly
 
 # synthetic recovery incl. location (data generated from green point 300)
-conda run -n pymc python run_eq02387_cmt.py --mode synthetic --sample-location \
+conda run -n pymc python run_event_cmt.py --mode synthetic --sample-location \
   --synth-pid 300 --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
   --p-fmin 2 --p-fmax 12 --s-fmin 2 --s-fmax 12 --max-shift-sec 0.04
 ```
@@ -275,7 +275,7 @@ Z first motions). Reference ZRT run
 (`report/eq02387_cmt_3d_loc250_fullmt_zrt_lp`):
 
 ```bash
-conda run -n pymc python run_eq02387_cmt.py \
+conda run -n pymc python run_event_cmt.py \
   --mode real --components Z,R,T --sample-location --loc-radius-m 250 \
   --gf-npz ../openswpc_cases/eq02387_green_dx30/gf_store_eq02387_green_dx30.npz \
   --p-fmin 2 --p-fmax 20 --s-fmin 2 --s-fmax 12 \
